@@ -15,8 +15,8 @@ from RealtimeSTT import AudioInput
 from colorama import init, Fore, Style
 init()
 
-DEFAULT_CONTROL_URL = "ws://127.0.0.1:8011"
-DEFAULT_DATA_URL = "ws://127.0.0.1:8012"
+DEFAULT_CONTROL_URL = "ws://34.59.53.174:8011"
+DEFAULT_DATA_URL = "ws://34.59.53.174:8012"
 
 recording_indicator = "🔴"
 
