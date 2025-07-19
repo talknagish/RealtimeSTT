@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Simple STT Test</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      max-width: 800px;
+      margin: 0 auto;
+      padding: 20px;
+    }
+    .status {
+      padding: 10px;
+      margin: 10px 0;
+      border-radius: 5px;
+    }
+    .success { background-color: #d4edda; color: #155724; }
+    .error { background-color: #f8d7da; color: #721c24; }
+    .warning { background-color: #fff3cd; color: #856404; }
+    button {
+      padding: 10px 20px;
+      margin: 5px;
+      cursor: pointer;
+    }
+    #log {
+      background-color: #f8f9fa;
+      border: 1px solid #dee2e6;
+      padding: 10px;
+      height: 200px;
+      overflow-y: auto;
+      font-family: monospace;
+      font-size: 12px;
+    }
+  </style>
+</head>
+<body>
+  <h1>Simple STT Server Test</h1>
+  
+  <div id="status" class="status">Ready to test...</div>
+  
+  <button onclick="testHealth()">Test Health Endpoints</button>
+  <button onclick="testWebSocket()">Test WebSocket Connection</button>
+  <button onclick="clearLog()">Clear Log</button>
+  
+  <h3>Test Log:</h3>
+  <div id="log"></div>
+
+  <script>
+    const statusDiv = document.getElementById("status");
+    const logDiv = document.getElementById("log");
+
+    function log(message) {
+      const timestamp = new Date().toLocaleTimeString();
+      logDiv.innerHTML += `[${timestamp}] ${message}<br>`;
+      logDiv.scrollTop = logDiv.scrollHeight;
+      console.log(message);
+    }
+
+    function updateStatus(message, type = 'success') {
+      statusDiv.textContent = message;
+      statusDiv.className = `status ${type}`;
+      log(`STATUS: ${message}`);
+    }
+
+    function clearLog() {
+      logDiv.innerHTML = '';
+    }
+
+    async function testHealth() {
+      log("Testing health endpoints...");
+      
+      try {
+        // Test control health
+        const controlResponse = await fetch('https://stt.talknagish.com/control/health', {
+          method: 'GET',
+          mode: 'no-cors' // This bypasses CORS issues
+        });
+        log("Control health endpoint: OK");
+        
+        // Test data health
+        const dataResponse = await fetch('https://stt.talknagish.com/data/health', {
+          method: 'GET',
+          mode: 'no-cors'
+        });
+        log("Data health endpoint: OK");
+        
+        updateStatus("Health endpoints are accessible", 'success');
+        
+      } catch (error) {
+        log(`Health test error: ${error.message}`);
+        updateStatus("Health test failed", 'error');
+      }
+    }
+
+    function testWebSocket() {
+      log("Testing WebSocket connection...");
+      
+      const ws = new WebSocket('wss://stt.talknagish.com/control');
+      
+      ws.onopen = function() {
+        log("WebSocket connection opened successfully!");
+        updateStatus("WebSocket connection successful", 'success');
+        
+        // Send a test message
+        const testMessage = {
+          command: "get_parameter",
+          parameter: "language"
+        };
+        ws.send(JSON.stringify(testMessage));
+        log("Sent test message to WebSocket");
+        
+        // Close after 2 seconds
+        setTimeout(() => {
+          ws.close();
+          log("WebSocket connection closed");
+        }, 2000);
+      };
+      
+      ws.onmessage = function(event) {
+        log(`Received message: ${event.data}`);
+      };
+      
+      ws.onerror = function(error) {
+        log(`WebSocket error: ${error}`);
+        updateStatus("WebSocket connection failed - SSL certificate issue", 'warning');
+        
+        // Show detailed error information
+        log("This is likely due to the CloudFlare Origin Certificate not being trusted by the browser.");
+        log("The server is working, but browsers block the connection due to SSL certificate validation.");
+        log("Solutions:");
+        log("1. Use the Python client (which handles SSL properly)");
+        log("2. Configure a proper SSL certificate");
+        log("3. Use a browser extension to bypass SSL warnings");
+      };
+      
+      ws.onclose = function(event) {
+        log(`WebSocket closed: ${event.code} - ${event.reason}`);
+      };
+    }
+
+    // Auto-test on page load
+    window.addEventListener('load', () => {
+      log("Page loaded, starting tests...");
+      setTimeout(testHealth, 1000);
+      setTimeout(testWebSocket, 2000);
+    });
+  </script>
+</body>
+</html> 

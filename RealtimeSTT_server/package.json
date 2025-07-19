@@ -1,0 +1,17 @@
+{
+  "name": "stt-proxy-server",
+  "version": "1.0.0",
+  "description": "Proxy server for STT WebSocket connections",
+  "main": "proxy.js",
+  "scripts": {
+    "start": "node proxy.js",
+    "dev": "nodemon proxy.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "http-proxy-middleware": "^2.0.6"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  }
+} 
