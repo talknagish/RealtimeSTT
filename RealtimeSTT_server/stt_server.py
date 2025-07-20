@@ -154,37 +154,8 @@ from RealtimeSTT import AudioToTextRecorder
 from scipy.signal import resample
 import numpy as np
 import websockets
-
-# Monkey patch websockets to handle health check connections gracefully
-original_handshake = websockets.asyncio.server.WebSocketServer.handshake
-
-async def patched_handshake(self, path, headers):
-    try:
-        return await original_handshake(self, path, headers)
-    except (websockets.exceptions.InvalidHandshake, websockets.exceptions.InvalidMessage) as e:
-        # This is likely a health check connection - log and ignore
-        debug_print(f"Health check connection detected via patched handshake: {e}")
-        # Return a simple HTTP response
-        return (200, [('Content-Type', 'text/plain')], b'OK')
-
-websockets.asyncio.server.WebSocketServer.handshake = patched_handshake
-
-# Also patch the connection handler to catch exceptions at a lower level
-original_conn_handler = websockets.asyncio.server.WebSocketServer.conn_handler
-
-async def patched_conn_handler(self, reader, writer):
-    try:
-        return await original_conn_handler(self, reader, writer)
-    except (websockets.exceptions.InvalidHandshake, websockets.exceptions.InvalidMessage) as e:
-        # This is likely a health check connection - log and ignore
-        debug_print(f"Health check connection detected via patched conn_handler: {e}")
-        return
-    except Exception as e:
-        # Log other errors but don't crash
-        debug_print(f"WebSocket error via patched conn_handler: {e}")
-        return
-
-websockets.asyncio.server.WebSocketServer.conn_handler = patched_conn_handler
+import aiohttp
+from aiohttp import web
 import threading
 import logging
 import wave
@@ -829,97 +800,7 @@ def make_callback(loop, callback):
         callback(*args, **kwargs, loop=loop)
     return inner_callback
 
-class HealthCheckProtocol(websockets.WebSocketServerProtocol):
-    """
-    Custom protocol that handles health check connections gracefully.
-    """
-    async def process_request(self, path, headers):
-        try:
-            # Check if this is a simple TCP connection (no headers or invalid headers)
-            if not headers or 'upgrade' not in [k.lower() for k in headers.keys()]:
-                # This is likely a health check - return a simple HTTP response
-                debug_print(f"Health check connection detected via process_request")
-                return (200, [('Content-Type', 'text/plain')], b'OK')
-            
-            # If it looks like a proper WebSocket request, let it proceed
-            return None
-        except Exception as e:
-            # If there's any error parsing headers, treat it as a health check
-            debug_print(f"Health check connection detected via process_request: {e}")
-            return (200, [('Content-Type', 'text/plain')], b'OK')
 
-class HealthCheckServer(websockets.WebSocketServer):
-    """
-    Custom server that handles health check connections gracefully.
-    """
-    async def handler(self, websocket, path):
-        try:
-            await super().handler(websocket, path)
-        except (websockets.exceptions.InvalidHandshake, websockets.exceptions.InvalidMessage) as e:
-            # This is likely a health check connection - log and ignore
-            debug_print(f"Health check connection detected via server handler: {e}")
-            return
-        except Exception as e:
-            # Log other errors but don't crash
-            debug_print(f"WebSocket error via server handler: {e}")
-            return
-
-async def handle_websocket_request(path, headers):
-    """
-    Handle WebSocket requests and catch handshake errors.
-    """
-    try:
-        # Check if this is a simple TCP connection (no headers or invalid headers)
-        if not headers or 'upgrade' not in [k.lower() for k in headers.keys()]:
-            # This is likely a health check - return a simple HTTP response
-            debug_print(f"Health check connection detected via process_request")
-            return (200, [('Content-Type', 'text/plain')], b'OK')
-        
-        # If it looks like a proper WebSocket request, let it proceed
-        return None
-    except Exception as e:
-        # If there's any error parsing headers, treat it as a health check
-        debug_print(f"Health check connection detected via process_request: {e}")
-        return (200, [('Content-Type', 'text/plain')], b'OK')
-
-async def handle_health_check(path, headers):
-    """
-    Handle health check connections gracefully.
-    This function is called before the WebSocket handshake to handle simple TCP connections.
-    """
-    try:
-        # Check if this is a simple TCP connection (no headers or invalid headers)
-        if not headers or 'upgrade' not in [k.lower() for k in headers.keys()]:
-            # This is likely a health check - return a simple HTTP response
-            return (200, [('Content-Type', 'text/plain')], b'OK')
-        
-        # If it looks like a proper WebSocket request, let it proceed
-        return None
-    except Exception as e:
-        # If there's any error parsing headers, treat it as a health check
-        debug_print(f"Health check connection detected: {e}")
-        return (200, [('Content-Type', 'text/plain')], b'OK')
-
-def safe_websocket_handler(handler_func):
-    """
-    Wrapper to safely handle WebSocket connections and catch handshake errors.
-    """
-    async def wrapper(websocket, path):
-        try:
-            await handler_func(websocket)
-        except websockets.exceptions.InvalidHandshake:
-            # This is likely a health check connection
-            debug_print(f"Invalid handshake from {websocket.remote_address} - likely health check")
-            return
-        except websockets.exceptions.ConnectionClosed:
-            # Normal connection close
-            debug_print(f"Connection closed from {websocket.remote_address}")
-            return
-        except Exception as e:
-            # Log other errors but don't crash
-            debug_print(f"WebSocket error from {websocket.remote_address}: {e}")
-            return
-    return wrapper
 
 
 
@@ -944,6 +825,25 @@ class HealthCheckWebSocketServer:
             # Log other errors but don't crash
             debug_print(f"WebSocket error from {websocket.remote_address}: {e}")
             return
+
+# Simple HTTP health check server
+async def health_check_handler(request):
+    """Simple HTTP health check endpoint that returns 200 OK"""
+    return web.Response(text="OK", content_type="text/plain")
+
+async def start_health_check_server(port=8080):
+    """Start a simple HTTP health check server on the specified port"""
+    app = web.Application()
+    app.router.add_get("/health", health_check_handler)
+    app.router.add_get("/", health_check_handler)  # Also respond to root path
+    
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    
+    print(f"{bcolors.OKGREEN}Health check server started on {bcolors.OKBLUE}http://0.0.0.0:{port}/health{bcolors.ENDC}")
+    return runner
 
 async def main_async():            
     global stop_recorder, recorder_config, global_args, control_server, data_server, control_queue, audio_queue
@@ -1023,19 +923,24 @@ async def main_async():
             control_server = await websockets.serve(
                 HealthCheckWebSocketServer(control_handler, "control"), 
                 "0.0.0.0", 
-                args.control,
-                create_protocol=HealthCheckProtocol
+                args.control
             )
             data_server = await websockets.serve(
                 HealthCheckWebSocketServer(data_handler, "data"), 
                 "0.0.0.0", 
-                args.data,
-                create_protocol=HealthCheckProtocol
+                args.data
             )
             print(f"{bcolors.OKGREEN}Control server started on {bcolors.OKBLUE}ws://0.0.0.0:{args.control}{bcolors.ENDC}")
             print(f"{bcolors.OKGREEN}Data server started on {bcolors.OKBLUE}ws://0.0.0.0:{args.data}{bcolors.ENDC}")
         except Exception as e:
             print(f"{bcolors.FAIL}Error starting WebSocket servers: {e}{bcolors.ENDC}")
+            raise
+
+        # Start HTTP health check server
+        try:
+            health_check_runner = await start_health_check_server(port=8080)
+        except Exception as e:
+            print(f"{bcolors.FAIL}Error starting health check server: {e}{bcolors.ENDC}")
             raise
 
         # Start the broadcast and recorder threads
@@ -1074,6 +979,11 @@ async def shutdown_procedure():
         data_server.close()
         await data_server.wait_closed()
         print(f"{bcolors.OKGREEN}Data server closed{bcolors.ENDC}")
+    
+    # Close health check server if it exists
+    if 'health_check_runner' in globals() and health_check_runner:
+        await health_check_runner.cleanup()
+        print(f"{bcolors.OKGREEN}Health check server closed{bcolors.ENDC}")
     
     if recorder:
         stop_recorder = True
