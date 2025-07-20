@@ -788,7 +788,7 @@ def make_callback(loop, callback):
     return inner_callback
 
 async def main_async():            
-    global stop_recorder, recorder_config, global_args
+    global stop_recorder, recorder_config, global_args, control_server, data_server
     args = parse_arguments()
     global_args = args
 
@@ -871,8 +871,11 @@ async def main_async():
 
         print(f"{bcolors.OKGREEN}Server started. Press Ctrl+C to stop the server.{bcolors.ENDC}")
 
-        # Run server tasks
-        await asyncio.gather(control_server.wait_closed(), data_server.wait_closed(), broadcast_task)
+        # Run server tasks - wait for broadcast task to complete or server shutdown
+        try:
+            await broadcast_task
+        except asyncio.CancelledError:
+            pass
     except OSError as e:
         print(f"{bcolors.FAIL}Error: Could not start server on specified ports. It’s possible another instance of the server is already running, or the ports are being used by another application.{bcolors.ENDC}")
     except KeyboardInterrupt:
@@ -883,7 +886,19 @@ async def main_async():
         print(f"{bcolors.OKGREEN}Server shutdown complete.{bcolors.ENDC}")
 
 async def shutdown_procedure():
-    global stop_recorder, recorder_thread
+    global stop_recorder, recorder_thread, control_server, data_server
+    
+    # Close WebSocket servers first
+    if 'control_server' in globals() and control_server:
+        control_server.close()
+        await control_server.wait_closed()
+        print(f"{bcolors.OKGREEN}Control server closed{bcolors.ENDC}")
+    
+    if 'data_server' in globals() and data_server:
+        data_server.close()
+        await data_server.wait_closed()
+        print(f"{bcolors.OKGREEN}Data server closed{bcolors.ENDC}")
+    
     if recorder:
         stop_recorder = True
         recorder.abort()
