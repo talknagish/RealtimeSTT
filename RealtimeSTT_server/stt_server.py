@@ -251,6 +251,8 @@ def format_timestamp_ns(timestamp_ns: int) -> str:
 def text_detected(text, loop):
     global prev_text
 
+    print(f"{bcolors.OKCYAN}[DEBUG] text_detected called with: '{text}'{bcolors.ENDC}")
+
     text = preprocess_text(text)
 
     if silence_timing:
@@ -305,6 +307,7 @@ def text_detected(text, loop):
         'type': 'realtime',
         'text': text
     })
+    print(f"{bcolors.OKGREEN}[DEBUG] Queuing realtime message: {message}{bcolors.ENDC}")
     asyncio.run_coroutine_threadsafe(audio_queue.put(message), loop)
 
     # Get current timestamp in HH:MM:SS.nnn format
@@ -779,6 +782,7 @@ async def data_handler(websocket):
 async def broadcast_audio_messages():
     while True:
         message = await audio_queue.get()
+        print(f"{bcolors.OKBLUE}[DEBUG] Broadcasting message: {message[:100]}...{bcolors.ENDC}")
         for conn in list(data_connections):
             try:
                 timestamp = datetime.now().strftime('%H:%M:%S.%f')[:-3]
@@ -786,7 +790,12 @@ async def broadcast_audio_messages():
                 if extended_logging:
                     print(f"  [{timestamp}] Sending message: {bcolors.OKBLUE}{message}{bcolors.ENDC}\n", flush=True, end="")
                 await conn.send(message)
-            except websockets.exceptions.ConnectionClosed:
+                print(f"{bcolors.OKGREEN}[DEBUG] Message sent successfully to client{bcolors.ENDC}")
+            except websockets.exceptions.ConnectionClosed as e:
+                print(f"{bcolors.WARNING}[DEBUG] Connection closed while sending: {e}{bcolors.ENDC}")
+                data_connections.remove(conn)
+            except Exception as e:
+                print(f"{bcolors.FAIL}[DEBUG] Error sending message: {e}{bcolors.ENDC}")
                 data_connections.remove(conn)
 
 # Simple HTTP health check server
