@@ -798,6 +798,69 @@ def make_callback(loop, callback):
         callback(*args, **kwargs, loop=loop)
     return inner_callback
 
+async def handle_health_check(path, headers):
+    """
+    Handle health check connections gracefully.
+    This function is called before the WebSocket handshake to handle simple TCP connections.
+    """
+    try:
+        # Check if this is a simple TCP connection (no headers or invalid headers)
+        if not headers or 'upgrade' not in [k.lower() for k in headers.keys()]:
+            # This is likely a health check - return a simple HTTP response
+            return (200, [('Content-Type', 'text/plain')], b'OK')
+        
+        # If it looks like a proper WebSocket request, let it proceed
+        return None
+    except Exception as e:
+        # If there's any error parsing headers, treat it as a health check
+        debug_print(f"Health check connection detected: {e}")
+        return (200, [('Content-Type', 'text/plain')], b'OK')
+
+def safe_websocket_handler(handler_func):
+    """
+    Wrapper to safely handle WebSocket connections and catch handshake errors.
+    """
+    async def wrapper(websocket, path):
+        try:
+            await handler_func(websocket)
+        except websockets.exceptions.InvalidHandshake:
+            # This is likely a health check connection
+            debug_print(f"Invalid handshake from {websocket.remote_address} - likely health check")
+            return
+        except websockets.exceptions.ConnectionClosed:
+            # Normal connection close
+            debug_print(f"Connection closed from {websocket.remote_address}")
+            return
+        except Exception as e:
+            # Log other errors but don't crash
+            debug_print(f"WebSocket error from {websocket.remote_address}: {e}")
+            return
+    return wrapper
+
+
+
+# Add a custom WebSocket server class to handle WebSocket connections
+class HealthCheckWebSocketServer:
+    def __init__(self, handler_func, server_name):
+        self.handler_func = handler_func
+        self.server_name = server_name
+    
+    async def __call__(self, websocket, path):
+        try:
+            await self.handler_func(websocket)
+        except websockets.exceptions.InvalidHandshake:
+            # This is likely a health check connection - log and ignore
+            debug_print(f"Invalid handshake from {websocket.remote_address} - likely health check")
+            return
+        except websockets.exceptions.ConnectionClosed:
+            # Normal connection close
+            debug_print(f"Connection closed from {websocket.remote_address}")
+            return
+        except Exception as e:
+            # Log other errors but don't crash
+            debug_print(f"WebSocket error from {websocket.remote_address}: {e}")
+            return
+
 async def main_async():            
     global stop_recorder, recorder_config, global_args, control_server, data_server, control_queue, audio_queue
     args = parse_arguments()
@@ -871,11 +934,23 @@ async def main_async():
     }
 
     try:
-        # Attempt to start control and data servers
-        control_server = await websockets.serve(control_handler, "0.0.0.0", args.control)
-        data_server = await websockets.serve(data_handler, "0.0.0.0", args.data)
-        print(f"{bcolors.OKGREEN}Control server started on {bcolors.OKBLUE}ws://0.0.0.0:{args.control}{bcolors.ENDC}")
-        print(f"{bcolors.OKGREEN}Data server started on {bcolors.OKBLUE}ws://0.0.0.0:{args.data}{bcolors.ENDC}")
+        # Attempt to start control and data servers with proper error handling
+        try:
+            control_server = await websockets.serve(
+                HealthCheckWebSocketServer(control_handler, "control"), 
+                "0.0.0.0", 
+                args.control
+            )
+            data_server = await websockets.serve(
+                HealthCheckWebSocketServer(data_handler, "data"), 
+                "0.0.0.0", 
+                args.data
+            )
+            print(f"{bcolors.OKGREEN}Control server started on {bcolors.OKBLUE}ws://0.0.0.0:{args.control}{bcolors.ENDC}")
+            print(f"{bcolors.OKGREEN}Data server started on {bcolors.OKBLUE}ws://0.0.0.0:{args.data}{bcolors.ENDC}")
+        except Exception as e:
+            print(f"{bcolors.FAIL}Error starting WebSocket servers: {e}{bcolors.ENDC}")
+            raise
 
         # Start the broadcast and recorder threads
         broadcast_task = asyncio.create_task(broadcast_audio_messages())
