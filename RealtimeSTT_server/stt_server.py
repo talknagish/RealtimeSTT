@@ -585,9 +585,15 @@ def _recorder_thread(loop):
     print(f"{bcolors.OKGREEN}Initializing RealtimeSTT server with parameters:{bcolors.ENDC}")
     for key, value in recorder_config.items():
         print(f"    {bcolors.OKBLUE}{key}{bcolors.ENDC}: {value}")
-    recorder = AudioToTextRecorder(**recorder_config)
-    print(f"{bcolors.OKGREEN}{bcolors.BOLD}RealtimeSTT initialized{bcolors.ENDC}")
-    recorder_ready.set()
+    try:
+        recorder = AudioToTextRecorder(**recorder_config)
+        print(f"{bcolors.OKGREEN}{bcolors.BOLD}RealtimeSTT initialized{bcolors.ENDC}")
+        recorder_ready.set()
+    except Exception as e:
+        print(f"{bcolors.FAIL}Error initializing RealtimeSTT: {e}{bcolors.ENDC}")
+        debug_print(f"Recorder initialization error details: {e}")
+        recorder_ready.set()  # Set ready even on error to prevent hanging
+        return
     
     def process_text(full_sentence):
         global prev_text, audio_queue
@@ -611,6 +617,9 @@ def _recorder_thread(loop):
             recorder.text(process_text)
     except KeyboardInterrupt:
         print(f"{bcolors.WARNING}Exiting application due to keyboard interrupt{bcolors.ENDC}")
+    except Exception as e:
+        print(f"{bcolors.FAIL}Error in recorder thread: {e}{bcolors.ENDC}")
+        debug_print(f"Recorder thread error details: {e}")
 
 def decode_and_resample(
         audio_data,
@@ -633,7 +642,7 @@ def decode_and_resample(
 
     return resampled_audio.astype(np.int16).tobytes()
 
-async def control_handler(websocket):
+async def control_handler(websocket, path):
     debug_print(f"New control connection from {websocket.remote_address}")
     print(f"{bcolors.OKGREEN}Control client connected{bcolors.ENDC}")
     global recorder
@@ -723,12 +732,19 @@ async def control_handler(websocket):
                     await websocket.send(json.dumps({"status": "error", "message": "Invalid JSON command"}))
             else:
                 print(f"{bcolors.WARNING}Received unknown message type on control connection{bcolors.ENDC}")
+    except (websockets.exceptions.InvalidHandshake, websockets.exceptions.InvalidMessage):
+        # This is likely a health check connection - log and ignore
+        debug_print(f"Invalid handshake/message from {websocket.remote_address} - likely health check")
+        return
     except websockets.exceptions.ConnectionClosed as e:
         print(f"{bcolors.WARNING}Control client disconnected: {e}{bcolors.ENDC}")
+    except Exception as e:
+        # Log other errors but don't crash
+        debug_print(f"WebSocket error from {websocket.remote_address}: {e}")
     finally:
         control_connections.remove(websocket)
 
-async def data_handler(websocket):
+async def data_handler(websocket, path):
     global writechunks, wav_file
     print(f"{bcolors.OKGREEN}Data client connected{bcolors.ENDC}")
     data_connections.add(websocket)
@@ -741,10 +757,14 @@ async def data_handler(websocket):
                 elif log_incoming_chunks:
                     print(".", end='', flush=True)
                 # Handle binary message (audio data)
-                metadata_length = int.from_bytes(message[:4], byteorder='little')
-                metadata_json = message[4:4+metadata_length].decode('utf-8')
-                metadata = json.loads(metadata_json)
-                sample_rate = metadata['sampleRate']
+                try:
+                    metadata_length = int.from_bytes(message[:4], byteorder='little')
+                    metadata_json = message[4:4+metadata_length].decode('utf-8')
+                    metadata = json.loads(metadata_json)
+                    sample_rate = metadata['sampleRate']
+                except (ValueError, json.JSONDecodeError, KeyError, UnicodeDecodeError) as e:
+                    debug_print(f"Error parsing audio metadata: {e}")
+                    continue
 
                 if 'server_sent_to_stt' in metadata:
                     stt_received_ns = time.time_ns()
@@ -757,25 +777,38 @@ async def data_handler(websocket):
                 chunk = message[4+metadata_length:]
 
                 if writechunks:
-                    if not wav_file:
-                        wav_file = wave.open(writechunks, 'wb')
-                        wav_file.setnchannels(CHANNELS)
-                        wav_file.setsampwidth(pyaudio.get_sample_size(FORMAT))
-                        wav_file.setframerate(sample_rate)
+                    try:
+                        if not wav_file:
+                            wav_file = wave.open(writechunks, 'wb')
+                            wav_file.setnchannels(CHANNELS)
+                            wav_file.setsampwidth(pyaudio.get_sample_size(FORMAT))
+                            wav_file.setframerate(sample_rate)
 
-                    wav_file.writeframes(chunk)
+                        wav_file.writeframes(chunk)
+                    except Exception as e:
+                        debug_print(f"Error writing to WAV file: {e}")
 
-                if sample_rate != 16000:
-                    resampled_chunk = decode_and_resample(chunk, sample_rate, 16000)
-                    if extended_logging:
-                        debug_print(f"Resampled chunk size: {len(resampled_chunk)} bytes")
-                    recorder.feed_audio(resampled_chunk)
-                else:
-                    recorder.feed_audio(chunk)
+                try:
+                    if sample_rate != 16000:
+                        resampled_chunk = decode_and_resample(chunk, sample_rate, 16000)
+                        if extended_logging:
+                            debug_print(f"Resampled chunk size: {len(resampled_chunk)} bytes")
+                        recorder.feed_audio(resampled_chunk)
+                    else:
+                        recorder.feed_audio(chunk)
+                except Exception as e:
+                    debug_print(f"Error processing audio chunk: {e}")
             else:
                 print(f"{bcolors.WARNING}Received non-binary message on data connection{bcolors.ENDC}")
+    except (websockets.exceptions.InvalidHandshake, websockets.exceptions.InvalidMessage):
+        # This is likely a health check connection - log and ignore
+        debug_print(f"Invalid handshake/message from {websocket.remote_address} - likely health check")
+        return
     except websockets.exceptions.ConnectionClosed as e:
         print(f"{bcolors.WARNING}Data client disconnected: {e}{bcolors.ENDC}")
+    except Exception as e:
+        # Log other errors but don't crash
+        debug_print(f"WebSocket error from {websocket.remote_address}: {e}")
     finally:
         data_connections.remove(websocket)
         recorder.clear_audio_queue()  # Ensure audio queue is cleared if client disconnects
@@ -793,6 +826,10 @@ async def broadcast_audio_messages():
                 await conn.send(message)
             except websockets.exceptions.ConnectionClosed:
                 data_connections.remove(conn)
+            except Exception as e:
+                # Log other errors but don't crash
+                debug_print(f"Error sending message to client: {e}")
+                data_connections.remove(conn)
 
 # Helper function to create event loop bound closures for callbacks
 def make_callback(loop, callback):
@@ -803,28 +840,6 @@ def make_callback(loop, callback):
 
 
 
-
-# Add a custom WebSocket server class to handle WebSocket connections
-class HealthCheckWebSocketServer:
-    def __init__(self, handler_func, server_name):
-        self.handler_func = handler_func
-        self.server_name = server_name
-    
-    async def __call__(self, websocket, path):
-        try:
-            await self.handler_func(websocket)
-        except (websockets.exceptions.InvalidHandshake, websockets.exceptions.InvalidMessage):
-            # This is likely a health check connection - log and ignore
-            debug_print(f"Invalid handshake/message from {websocket.remote_address} - likely health check")
-            return
-        except websockets.exceptions.ConnectionClosed:
-            # Normal connection close
-            debug_print(f"Connection closed from {websocket.remote_address}")
-            return
-        except Exception as e:
-            # Log other errors but don't crash
-            debug_print(f"WebSocket error from {websocket.remote_address}: {e}")
-            return
 
 # Simple HTTP health check server
 async def health_check_handler(request):
@@ -921,12 +936,12 @@ async def main_async():
         # Attempt to start control and data servers with proper error handling
         try:
             control_server = await websockets.serve(
-                HealthCheckWebSocketServer(control_handler, "control"), 
+                control_handler, 
                 "0.0.0.0", 
                 args.control
             )
             data_server = await websockets.serve(
-                HealthCheckWebSocketServer(data_handler, "data"), 
+                data_handler, 
                 "0.0.0.0", 
                 args.data
             )
@@ -967,7 +982,7 @@ async def main_async():
         print(f"{bcolors.OKGREEN}Server shutdown complete.{bcolors.ENDC}")
 
 async def shutdown_procedure():
-    global stop_recorder, recorder_thread, control_server, data_server
+    global stop_recorder, recorder_thread, control_server, data_server, wav_file
     
     # Close WebSocket servers first
     if 'control_server' in globals() and control_server:
@@ -996,6 +1011,14 @@ async def shutdown_procedure():
             recorder_thread.join()
             print(f"{bcolors.OKGREEN}Recorder thread finished{bcolors.ENDC}")
 
+    # Close WAV file if it's open
+    if wav_file:
+        try:
+            wav_file.close()
+            print(f"{bcolors.OKGREEN}WAV file closed{bcolors.ENDC}")
+        except Exception as e:
+            debug_print(f"Error closing WAV file: {e}")
+
     tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
     for task in tasks:
         task.cancel()
@@ -1010,6 +1033,10 @@ def main():
         # Capture any final KeyboardInterrupt to prevent it from showing up in logs
         print(f"{bcolors.WARNING}Server interrupted by user.{bcolors.ENDC}")
         exit(0)
+    except Exception as e:
+        print(f"{bcolors.FAIL}Unexpected error in main: {e}{bcolors.ENDC}")
+        debug_print(f"Main function error details: {e}")
+        exit(1)
 
 if __name__ == '__main__':
     main()
