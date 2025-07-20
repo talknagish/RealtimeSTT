@@ -168,6 +168,23 @@ async def patched_handshake(self, path, headers):
         return (200, [('Content-Type', 'text/plain')], b'OK')
 
 websockets.asyncio.server.WebSocketServer.handshake = patched_handshake
+
+# Also patch the connection handler to catch exceptions at a lower level
+original_conn_handler = websockets.asyncio.server.WebSocketServer.conn_handler
+
+async def patched_conn_handler(self, reader, writer):
+    try:
+        return await original_conn_handler(self, reader, writer)
+    except (websockets.exceptions.InvalidHandshake, websockets.exceptions.InvalidMessage) as e:
+        # This is likely a health check connection - log and ignore
+        debug_print(f"Health check connection detected via patched conn_handler: {e}")
+        return
+    except Exception as e:
+        # Log other errors but don't crash
+        debug_print(f"WebSocket error via patched conn_handler: {e}")
+        return
+
+websockets.asyncio.server.WebSocketServer.conn_handler = patched_conn_handler
 import threading
 import logging
 import wave
