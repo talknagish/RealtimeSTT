@@ -293,10 +293,12 @@ def text_detected(text, loop):
             # Compute the similarity ratio between the first and last texts
             similarity = SequenceMatcher(None, first_text, last_text).ratio()
 
+            # FIXED: Don't stop the recorder, just clear the text queue to prevent infinite loops
             if similarity > hard_break_even_on_background_noise_min_similarity and len(first_text) > hard_break_even_on_background_noise_min_chars:
-                recorder.stop()
-                recorder.clear_audio_queue()
+                # Instead of stopping the recorder, just clear the text queue and reset prev_text
+                text_time_deque.clear()
                 prev_text = ""
+                debug_print("Cleared text queue due to repeated similar text (background noise detection)")
 
     prev_text = text
 
@@ -749,6 +751,10 @@ async def control_handler(websocket):
 async def data_handler(websocket):
     global writechunks, wav_file
     print(f"{bcolors.OKGREEN}Data client connected{bcolors.ENDC}")
+    
+    # FIXED: Reset recorder state for new connections
+    reset_recorder_state()
+    
     data_connections.add(websocket)
     try:
         while True:
@@ -791,6 +797,11 @@ async def data_handler(websocket):
                         debug_print(f"Error writing to WAV file: {e}")
 
                 try:
+                    # FIXED: Check if recorder is ready before feeding audio
+                    if not recorder_ready.is_set():
+                        debug_print("Recorder not ready, skipping audio chunk")
+                        continue
+                        
                     if sample_rate != 16000:
                         resampled_chunk = decode_and_resample(chunk, sample_rate, 16000)
                         if extended_logging:
@@ -800,6 +811,13 @@ async def data_handler(websocket):
                         recorder.feed_audio(chunk)
                 except Exception as e:
                     debug_print(f"Error processing audio chunk: {e}")
+                    # FIXED: If there's an error with the recorder, try to restart it
+                    if "recorder" in str(e).lower() or "audio" in str(e).lower():
+                        debug_print("Attempting to restart recorder due to error")
+                        try:
+                            recorder.clear_audio_queue()
+                        except:
+                            pass
             else:
                 print(f"{bcolors.WARNING}Received non-binary message on data connection{bcolors.ENDC}")
     except (websockets.exceptions.InvalidHandshake, websockets.exceptions.InvalidMessage):
@@ -813,7 +831,13 @@ async def data_handler(websocket):
         debug_print(f"WebSocket error from {websocket.remote_address}: {e}")
     finally:
         data_connections.remove(websocket)
-        recorder.clear_audio_queue()  # Ensure audio queue is cleared if client disconnects
+        # FIXED: Only clear audio queue if no other clients are connected
+        if len(data_connections) == 0:
+            try:
+                recorder.clear_audio_queue()
+                debug_print("Cleared audio queue - no clients connected")
+            except Exception as e:
+                debug_print(f"Error clearing audio queue: {e}")
 
 async def broadcast_audio_messages():
     global audio_queue
@@ -832,6 +856,25 @@ async def broadcast_audio_messages():
                 # Log other errors but don't crash
                 debug_print(f"Error sending message to client: {e}")
                 data_connections.remove(conn)
+
+# Add this function after the make_callback function
+def reset_recorder_state():
+    """Reset the recorder state to handle reconnections"""
+    global prev_text, text_time_deque
+    try:
+        # Clear text-related state
+        prev_text = ""
+        text_time_deque.clear()
+        
+        # Clear audio queue if recorder exists
+        if recorder:
+            try:
+                recorder.clear_audio_queue()
+                debug_print("Reset recorder state for new connection")
+            except Exception as e:
+                debug_print(f"Error clearing recorder audio queue: {e}")
+    except Exception as e:
+        debug_print(f"Error resetting recorder state: {e}")
 
 # Helper function to create event loop bound closures for callbacks
 def make_callback(loop, callback):
