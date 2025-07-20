@@ -154,6 +154,20 @@ from RealtimeSTT import AudioToTextRecorder
 from scipy.signal import resample
 import numpy as np
 import websockets
+
+# Monkey patch websockets to handle health check connections gracefully
+original_handshake = websockets.asyncio.server.WebSocketServer.handshake
+
+async def patched_handshake(self, path, headers):
+    try:
+        return await original_handshake(self, path, headers)
+    except (websockets.exceptions.InvalidHandshake, websockets.exceptions.InvalidMessage) as e:
+        # This is likely a health check connection - log and ignore
+        debug_print(f"Health check connection detected via patched handshake: {e}")
+        # Return a simple HTTP response
+        return (200, [('Content-Type', 'text/plain')], b'OK')
+
+websockets.asyncio.server.WebSocketServer.handshake = patched_handshake
 import threading
 import logging
 import wave
@@ -816,6 +830,22 @@ class HealthCheckProtocol(websockets.WebSocketServerProtocol):
             # If there's any error parsing headers, treat it as a health check
             debug_print(f"Health check connection detected via process_request: {e}")
             return (200, [('Content-Type', 'text/plain')], b'OK')
+
+class HealthCheckServer(websockets.WebSocketServer):
+    """
+    Custom server that handles health check connections gracefully.
+    """
+    async def handler(self, websocket, path):
+        try:
+            await super().handler(websocket, path)
+        except (websockets.exceptions.InvalidHandshake, websockets.exceptions.InvalidMessage) as e:
+            # This is likely a health check connection - log and ignore
+            debug_print(f"Health check connection detected via server handler: {e}")
+            return
+        except Exception as e:
+            # Log other errors but don't crash
+            debug_print(f"WebSocket error via server handler: {e}")
+            return
 
 async def handle_websocket_request(path, headers):
     """
