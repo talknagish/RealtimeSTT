@@ -199,8 +199,8 @@ allowed_parameters = [
 # Queues and connections for control and data
 control_connections = set()
 data_connections = set()
-control_queue = None
-audio_queue = None
+control_queue = asyncio.Queue()
+audio_queue = asyncio.Queue()
 
 def preprocess_text(text):
     # Remove leading whitespaces
@@ -249,7 +249,7 @@ def format_timestamp_ns(timestamp_ns: int) -> str:
     return formatted_timestamp
 
 def text_detected(text, loop):
-    global prev_text, audio_queue
+    global prev_text
 
     text = preprocess_text(text)
 
@@ -293,11 +293,10 @@ def text_detected(text, loop):
             # Compute the similarity ratio between the first and last texts
             similarity = SequenceMatcher(None, first_text, last_text).ratio()
 
-            # SIMPLIFIED: Just clear the text queue instead of stopping the recorder
             if similarity > hard_break_even_on_background_noise_min_similarity and len(first_text) > hard_break_even_on_background_noise_min_chars:
-                text_time_deque.clear()
+                recorder.stop()
+                recorder.clear_audio_queue()
                 prev_text = ""
-                debug_print("Cleared text queue due to repeated similar text (background noise detection)")
 
     prev_text = text
 
@@ -317,56 +316,48 @@ def text_detected(text, loop):
         print(f"\r[{timestamp}] {bcolors.OKCYAN}{text}{bcolors.ENDC}", flush=True, end='')
 
 def on_recording_start(loop):
-    global audio_queue
     message = json.dumps({
         'type': 'recording_start'
     })
     asyncio.run_coroutine_threadsafe(audio_queue.put(message), loop)
 
 def on_recording_stop(loop):
-    global audio_queue
     message = json.dumps({
         'type': 'recording_stop'
     })
     asyncio.run_coroutine_threadsafe(audio_queue.put(message), loop)
 
 def on_vad_detect_start(loop):
-    global audio_queue
     message = json.dumps({
         'type': 'vad_detect_start'
     })
     asyncio.run_coroutine_threadsafe(audio_queue.put(message), loop)
 
 def on_vad_detect_stop(loop):
-    global audio_queue
     message = json.dumps({
         'type': 'vad_detect_stop'
     })
     asyncio.run_coroutine_threadsafe(audio_queue.put(message), loop)
 
 def on_wakeword_detected(loop):
-    global audio_queue
     message = json.dumps({
         'type': 'wakeword_detected'
     })
     asyncio.run_coroutine_threadsafe(audio_queue.put(message), loop)
 
 def on_wakeword_detection_start(loop):
-    global audio_queue
     message = json.dumps({
         'type': 'wakeword_detection_start'
     })
     asyncio.run_coroutine_threadsafe(audio_queue.put(message), loop)
 
 def on_wakeword_detection_end(loop):
-    global audio_queue
     message = json.dumps({
         'type': 'wakeword_detection_end'
     })
     asyncio.run_coroutine_threadsafe(audio_queue.put(message), loop)
 
 def on_transcription_start(_audio_bytes, loop):
-    global audio_queue
     bytes_b64 = base64.b64encode(_audio_bytes.tobytes()).decode('utf-8')
     message = json.dumps({
         'type': 'transcription_start',
@@ -375,7 +366,6 @@ def on_transcription_start(_audio_bytes, loop):
     asyncio.run_coroutine_threadsafe(audio_queue.put(message), loop)
 
 def on_turn_detection_start(loop):
-    global audio_queue
     print("&&& stt_server on_turn_detection_start")
     message = json.dumps({
         'type': 'start_turn_detection'
@@ -383,7 +373,6 @@ def on_turn_detection_start(loop):
     asyncio.run_coroutine_threadsafe(audio_queue.put(message), loop)
 
 def on_turn_detection_stop(loop):
-    global audio_queue
     print("&&& stt_server on_turn_detection_stop")
     message = json.dumps({
         'type': 'stop_turn_detection'
@@ -588,19 +577,12 @@ def _recorder_thread(loop):
     print(f"{bcolors.OKGREEN}Initializing RealtimeSTT server with parameters:{bcolors.ENDC}")
     for key, value in recorder_config.items():
         print(f"    {bcolors.OKBLUE}{key}{bcolors.ENDC}: {value}")
-    
-    try:
-        recorder = AudioToTextRecorder(**recorder_config)
-        print(f"{bcolors.OKGREEN}{bcolors.BOLD}RealtimeSTT initialized{bcolors.ENDC}")
-        recorder_ready.set()
-    except Exception as e:
-        print(f"{bcolors.FAIL}Error initializing RealtimeSTT: {e}{bcolors.ENDC}")
-        debug_print(f"Recorder initialization error details: {e}")
-        recorder_ready.set()  # Set ready even on error to prevent hanging
-        return
+    recorder = AudioToTextRecorder(**recorder_config)
+    print(f"{bcolors.OKGREEN}{bcolors.BOLD}RealtimeSTT initialized{bcolors.ENDC}")
+    recorder_ready.set()
     
     def process_text(full_sentence):
-        global prev_text, audio_queue
+        global prev_text
         prev_text = ""
         full_sentence = preprocess_text(full_sentence)
         message = json.dumps({
@@ -616,15 +598,11 @@ def _recorder_thread(loop):
             print(f"  [{timestamp}] Full text: {bcolors.BOLD}Sentence:{bcolors.ENDC} {bcolors.OKGREEN}{full_sentence}{bcolors.ENDC}\n", flush=True, end="")
         else:
             print(f"\r[{timestamp}] {bcolors.BOLD}Sentence:{bcolors.ENDC} {bcolors.OKGREEN}{full_sentence}{bcolors.ENDC}\n")
-    
     try:
         while not stop_recorder:
             recorder.text(process_text)
     except KeyboardInterrupt:
         print(f"{bcolors.WARNING}Exiting application due to keyboard interrupt{bcolors.ENDC}")
-    except Exception as e:
-        print(f"{bcolors.FAIL}Error in recorder thread: {e}{bcolors.ENDC}")
-        debug_print(f"Recorder thread error details: {e}")
 
 def decode_and_resample(
         audio_data,
@@ -737,15 +715,8 @@ async def control_handler(websocket):
                     await websocket.send(json.dumps({"status": "error", "message": "Invalid JSON command"}))
             else:
                 print(f"{bcolors.WARNING}Received unknown message type on control connection{bcolors.ENDC}")
-    except (websockets.exceptions.InvalidHandshake, websockets.exceptions.InvalidMessage):
-        # This is likely a health check connection - log and ignore
-        debug_print(f"Invalid handshake/message from {websocket.remote_address} - likely health check")
-        return
     except websockets.exceptions.ConnectionClosed as e:
         print(f"{bcolors.WARNING}Control client disconnected: {e}{bcolors.ENDC}")
-    except Exception as e:
-        # Log other errors but don't crash
-        debug_print(f"WebSocket error from {websocket.remote_address}: {e}")
     finally:
         control_connections.remove(websocket)
 
@@ -762,14 +733,10 @@ async def data_handler(websocket):
                 elif log_incoming_chunks:
                     print(".", end='', flush=True)
                 # Handle binary message (audio data)
-                try:
-                    metadata_length = int.from_bytes(message[:4], byteorder='little')
-                    metadata_json = message[4:4+metadata_length].decode('utf-8')
-                    metadata = json.loads(metadata_json)
-                    sample_rate = metadata['sampleRate']
-                except (ValueError, json.JSONDecodeError, KeyError, UnicodeDecodeError) as e:
-                    debug_print(f"Error parsing audio metadata: {e}")
-                    continue
+                metadata_length = int.from_bytes(message[:4], byteorder='little')
+                metadata_json = message[4:4+metadata_length].decode('utf-8')
+                metadata = json.loads(metadata_json)
+                sample_rate = metadata['sampleRate']
 
                 if 'server_sent_to_stt' in metadata:
                     stt_received_ns = time.time_ns()
@@ -782,54 +749,30 @@ async def data_handler(websocket):
                 chunk = message[4+metadata_length:]
 
                 if writechunks:
-                    try:
-                        if not wav_file:
-                            wav_file = wave.open(writechunks, 'wb')
-                            wav_file.setnchannels(CHANNELS)
-                            wav_file.setsampwidth(pyaudio.get_sample_size(FORMAT))
-                            wav_file.setframerate(sample_rate)
+                    if not wav_file:
+                        wav_file = wave.open(writechunks, 'wb')
+                        wav_file.setnchannels(CHANNELS)
+                        wav_file.setsampwidth(pyaudio.get_sample_size(FORMAT))
+                        wav_file.setframerate(sample_rate)
 
-                        wav_file.writeframes(chunk)
-                    except Exception as e:
-                        debug_print(f"Error writing to WAV file: {e}")
+                    wav_file.writeframes(chunk)
 
-                try:
-                    # Check if recorder is ready before feeding audio
-                    if not recorder_ready.is_set():
-                        debug_print("Recorder not ready, skipping audio chunk")
-                        continue
-                        
-                    if sample_rate != 16000:
-                        resampled_chunk = decode_and_resample(chunk, sample_rate, 16000)
-                        if extended_logging:
-                            debug_print(f"Resampled chunk size: {len(resampled_chunk)} bytes")
-                        recorder.feed_audio(resampled_chunk)
-                    else:
-                        recorder.feed_audio(chunk)
-                        
-                except Exception as e:
-                    debug_print(f"Error processing audio chunk: {e}")
+                if sample_rate != 16000:
+                    resampled_chunk = decode_and_resample(chunk, sample_rate, 16000)
+                    if extended_logging:
+                        debug_print(f"Resampled chunk size: {len(resampled_chunk)} bytes")
+                    recorder.feed_audio(resampled_chunk)
+                else:
+                    recorder.feed_audio(chunk)
             else:
                 print(f"{bcolors.WARNING}Received non-binary message on data connection{bcolors.ENDC}")
-    except (websockets.exceptions.InvalidHandshake, websockets.exceptions.InvalidMessage):
-        # This is likely a health check connection - log and ignore
-        debug_print(f"Invalid handshake/message from {websocket.remote_address} - likely health check")
-        return
     except websockets.exceptions.ConnectionClosed as e:
         print(f"{bcolors.WARNING}Data client disconnected: {e}{bcolors.ENDC}")
-    except Exception as e:
-        # Log other errors but don't crash
-        debug_print(f"WebSocket error from {websocket.remote_address}: {e}")
     finally:
         data_connections.remove(websocket)
-        # Simple cleanup - clear audio queue when client disconnects
-        try:
-            recorder.clear_audio_queue()
-        except Exception as e:
-            debug_print(f"Error clearing audio queue: {e}")
+        recorder.clear_audio_queue()  # Ensure audio queue is cleared if client disconnects
 
 async def broadcast_audio_messages():
-    global audio_queue
     while True:
         message = await audio_queue.get()
         for conn in list(data_connections):
@@ -841,20 +784,6 @@ async def broadcast_audio_messages():
                 await conn.send(message)
             except websockets.exceptions.ConnectionClosed:
                 data_connections.remove(conn)
-            except Exception as e:
-                # Log other errors but don't crash
-                debug_print(f"Error sending message to client: {e}")
-                data_connections.remove(conn)
-
-# Helper function to create event loop bound closures for callbacks
-def make_callback(loop, callback):
-    def inner_callback(*args, **kwargs):
-        callback(*args, **kwargs, loop=loop)
-    return inner_callback
-
-
-
-
 
 # Simple HTTP health check server
 async def health_check_handler(request):
@@ -875,17 +804,19 @@ async def start_health_check_server(port=8080):
     print(f"{bcolors.OKGREEN}Health check server started on {bcolors.OKBLUE}http://0.0.0.0:{port}/health{bcolors.ENDC}")
     return runner
 
+# Helper function to create event loop bound closures for callbacks
+def make_callback(loop, callback):
+    def inner_callback(*args, **kwargs):
+        callback(*args, **kwargs, loop=loop)
+    return inner_callback
+
 async def main_async():            
-    global stop_recorder, recorder_config, global_args, control_server, data_server, control_queue, audio_queue
+    global stop_recorder, recorder_config, global_args
     args = parse_arguments()
     global_args = args
 
     # Get the event loop here and pass it to the recorder thread
     loop = asyncio.get_event_loop()
-    
-    # Initialize asyncio queues within the event loop context
-    control_queue = asyncio.Queue()
-    audio_queue = asyncio.Queue()
 
     recorder_config = {
         'model': args.model,
@@ -1049,10 +980,6 @@ def main():
         # Capture any final KeyboardInterrupt to prevent it from showing up in logs
         print(f"{bcolors.WARNING}Server interrupted by user.{bcolors.ENDC}")
         exit(0)
-    except Exception as e:
-        print(f"{bcolors.FAIL}Unexpected error in main: {e}{bcolors.ENDC}")
-        debug_print(f"Main function error details: {e}")
-        exit(1)
 
 if __name__ == '__main__':
     main()
