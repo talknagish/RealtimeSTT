@@ -245,7 +245,7 @@ def format_timestamp_ns(timestamp_ns: int) -> str:
     return formatted_timestamp
 
 def text_detected(text, loop):
-    global prev_text
+    global prev_text, audio_queue
 
     text = preprocess_text(text)
 
@@ -312,48 +312,56 @@ def text_detected(text, loop):
         print(f"\r[{timestamp}] {bcolors.OKCYAN}{text}{bcolors.ENDC}", flush=True, end='')
 
 def on_recording_start(loop):
+    global audio_queue
     message = json.dumps({
         'type': 'recording_start'
     })
     asyncio.run_coroutine_threadsafe(audio_queue.put(message), loop)
 
 def on_recording_stop(loop):
+    global audio_queue
     message = json.dumps({
         'type': 'recording_stop'
     })
     asyncio.run_coroutine_threadsafe(audio_queue.put(message), loop)
 
 def on_vad_detect_start(loop):
+    global audio_queue
     message = json.dumps({
         'type': 'vad_detect_start'
     })
     asyncio.run_coroutine_threadsafe(audio_queue.put(message), loop)
 
 def on_vad_detect_stop(loop):
+    global audio_queue
     message = json.dumps({
         'type': 'vad_detect_stop'
     })
     asyncio.run_coroutine_threadsafe(audio_queue.put(message), loop)
 
 def on_wakeword_detected(loop):
+    global audio_queue
     message = json.dumps({
         'type': 'wakeword_detected'
     })
     asyncio.run_coroutine_threadsafe(audio_queue.put(message), loop)
 
 def on_wakeword_detection_start(loop):
+    global audio_queue
     message = json.dumps({
         'type': 'wakeword_detection_start'
     })
     asyncio.run_coroutine_threadsafe(audio_queue.put(message), loop)
 
 def on_wakeword_detection_end(loop):
+    global audio_queue
     message = json.dumps({
         'type': 'wakeword_detection_end'
     })
     asyncio.run_coroutine_threadsafe(audio_queue.put(message), loop)
 
 def on_transcription_start(_audio_bytes, loop):
+    global audio_queue
     bytes_b64 = base64.b64encode(_audio_bytes.tobytes()).decode('utf-8')
     message = json.dumps({
         'type': 'transcription_start',
@@ -362,6 +370,7 @@ def on_transcription_start(_audio_bytes, loop):
     asyncio.run_coroutine_threadsafe(audio_queue.put(message), loop)
 
 def on_turn_detection_start(loop):
+    global audio_queue
     print("&&& stt_server on_turn_detection_start")
     message = json.dumps({
         'type': 'start_turn_detection'
@@ -369,6 +378,7 @@ def on_turn_detection_start(loop):
     asyncio.run_coroutine_threadsafe(audio_queue.put(message), loop)
 
 def on_turn_detection_stop(loop):
+    global audio_queue
     print("&&& stt_server on_turn_detection_stop")
     message = json.dumps({
         'type': 'stop_turn_detection'
@@ -578,7 +588,7 @@ def _recorder_thread(loop):
     recorder_ready.set()
     
     def process_text(full_sentence):
-        global prev_text
+        global prev_text, audio_queue
         prev_text = ""
         full_sentence = preprocess_text(full_sentence)
         message = json.dumps({
@@ -769,6 +779,7 @@ async def data_handler(websocket):
         recorder.clear_audio_queue()  # Ensure audio queue is cleared if client disconnects
 
 async def broadcast_audio_messages():
+    global audio_queue
     while True:
         message = await audio_queue.get()
         for conn in list(data_connections):
