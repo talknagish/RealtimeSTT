@@ -154,6 +154,8 @@ from RealtimeSTT import AudioToTextRecorder
 from scipy.signal import resample
 import numpy as np
 import websockets
+from websockets.asyncio.server import serve
+from websockets.exceptions import ConnectionClosed
 import aiohttp
 from aiohttp import web
 import threading
