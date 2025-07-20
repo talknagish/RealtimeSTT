@@ -935,12 +935,12 @@ async def main_async():
     try:
         # Attempt to start control and data servers with proper error handling
         try:
-            control_server = await websockets.serve(
+            control_server = await serve(
                 control_handler, 
                 "0.0.0.0", 
                 args.control
             )
-            data_server = await websockets.serve(
+            data_server = await serve(
                 data_handler, 
                 "0.0.0.0", 
                 args.data
