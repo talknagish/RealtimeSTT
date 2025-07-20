@@ -171,6 +171,7 @@ recorder_ready = threading.Event()
 recorder_thread = None
 stop_recorder = False
 prev_text = ""
+health_check_runner = None
 
 # Define allowed methods and parameters for security
 allowed_methods = [
@@ -383,23 +384,23 @@ def on_turn_detection_stop(loop):
     asyncio.run_coroutine_threadsafe(audio_queue.put(message), loop)
 
 
-# def on_realtime_transcription_update(text, loop):
-#     # Send real-time transcription updates to the client
-#     text = preprocess_text(text)
-#     message = json.dumps({
-#         'type': 'realtime_update',
-#         'text': text
-#     })
-#     asyncio.run_coroutine_threadsafe(audio_queue.put(message), loop)
+def on_realtime_transcription_update(text, loop):
+    # Send real-time transcription updates to the client
+    text = preprocess_text(text)
+    message = json.dumps({
+        'type': 'realtime_update',
+        'text': text
+    })
+    asyncio.run_coroutine_threadsafe(audio_queue.put(message), loop)
 
-# def on_recorded_chunk(chunk, loop):
-#     if send_recorded_chunk:
-#         bytes_b64 = base64.b64encode(chunk.tobytes()).decode('utf-8')
-#         message = json.dumps({
-#             'type': 'recorded_chunk',
-#             'bytes': bytes_b64
-#         })
-#         asyncio.run_coroutine_threadsafe(audio_queue.put(message), loop)
+def on_recorded_chunk(chunk, loop):
+    if send_recorded_chunk:
+        bytes_b64 = base64.b64encode(chunk.tobytes()).decode('utf-8')
+        message = json.dumps({
+            'type': 'recorded_chunk',
+            'bytes': bytes_b64
+        })
+        asyncio.run_coroutine_threadsafe(audio_queue.put(message), loop)
 
 # Define the server's arguments
 def parse_arguments():
@@ -603,9 +604,7 @@ def _recorder_thread(loop):
             print(f"\r[{timestamp}] {bcolors.BOLD}Sentence:{bcolors.ENDC} {bcolors.OKGREEN}{full_sentence}{bcolors.ENDC}\n")
     try:
         while not stop_recorder:
-            print(f"{bcolors.OKCYAN}[DEBUG] Recorder thread waiting for audio...{bcolors.ENDC}")
             recorder.text(process_text)
-            print(f"{bcolors.OKCYAN}[DEBUG] Recorder.text() returned, continuing loop{bcolors.ENDC}")
     except KeyboardInterrupt:
         print(f"{bcolors.WARNING}Exiting application due to keyboard interrupt{bcolors.ENDC}")
     except Exception as e:
@@ -732,7 +731,6 @@ async def control_handler(websocket):
 async def data_handler(websocket):
     global writechunks, wav_file
     print(f"{bcolors.OKGREEN}Data client connected{bcolors.ENDC}")
-    print(f"{bcolors.OKBLUE}[DEBUG] New data client connected, total connections: {len(data_connections) + 1}{bcolors.ENDC}")
     data_connections.add(websocket)
     try:
         while True:
@@ -767,7 +765,6 @@ async def data_handler(websocket):
 
                     wav_file.writeframes(chunk)
 
-                print(f"{bcolors.OKCYAN}[DEBUG] Feeding audio chunk to recorder (size: {len(chunk)} bytes){bcolors.ENDC}")
                 if sample_rate != 16000:
                     resampled_chunk = decode_and_resample(chunk, sample_rate, 16000)
                     if extended_logging:
@@ -775,20 +772,17 @@ async def data_handler(websocket):
                     recorder.feed_audio(resampled_chunk)
                 else:
                     recorder.feed_audio(chunk)
-                print(f"{bcolors.OKGREEN}[DEBUG] Audio chunk fed to recorder successfully{bcolors.ENDC}")
             else:
                 print(f"{bcolors.WARNING}Received non-binary message on data connection{bcolors.ENDC}")
     except websockets.exceptions.ConnectionClosed as e:
         print(f"{bcolors.WARNING}Data client disconnected: {e}{bcolors.ENDC}")
     finally:
-        data_connections.remove(websocket)
-        print(f"{bcolors.OKBLUE}[DEBUG] Data client removed, total connections: {len(data_connections)}{bcolors.ENDC}")
+        data_connections.discard(websocket)
         # recorder.clear_audio_queue()  # This was interfering with recorder state
 
 async def broadcast_audio_messages():
     while True:
         message = await audio_queue.get()
-        print(f"{bcolors.OKBLUE}[DEBUG] Broadcasting message: {message[:100]}...{bcolors.ENDC}")
         for conn in list(data_connections):
             try:
                 timestamp = datetime.now().strftime('%H:%M:%S.%f')[:-3]
@@ -796,13 +790,11 @@ async def broadcast_audio_messages():
                 if extended_logging:
                     print(f"  [{timestamp}] Sending message: {bcolors.OKBLUE}{message}{bcolors.ENDC}\n", flush=True, end="")
                 await conn.send(message)
-                print(f"{bcolors.OKGREEN}[DEBUG] Message sent successfully to client{bcolors.ENDC}")
             except websockets.exceptions.ConnectionClosed as e:
-                print(f"{bcolors.WARNING}[DEBUG] Connection closed while sending: {e}{bcolors.ENDC}")
-                data_connections.remove(conn)
+                data_connections.discard(conn)
             except Exception as e:
                 print(f"{bcolors.FAIL}[DEBUG] Error sending message: {e}{bcolors.ENDC}")
-                data_connections.remove(conn)
+                # Don't remove connection for general exceptions, only for ConnectionClosed
 
 # Simple HTTP health check server
 async def health_check_handler(request):
@@ -830,7 +822,7 @@ def make_callback(loop, callback):
     return inner_callback
 
 async def main_async():            
-    global stop_recorder, recorder_config, global_args
+    global stop_recorder, recorder_config, global_args, health_check_runner
     args = parse_arguments()
     global_args = args
 
@@ -884,7 +876,7 @@ async def main_async():
         'on_turn_detection_start': make_callback(loop, on_turn_detection_start),
         'on_turn_detection_stop': make_callback(loop, on_turn_detection_stop),
 
-        # 'on_recorded_chunk': make_callback(loop, on_recorded_chunk),
+        'on_recorded_chunk': make_callback(loop, on_recorded_chunk),
         'no_log_file': True,  # Disable logging to file
         'use_extended_logging': args.use_extended_logging,
         'level': loglevel,
@@ -947,7 +939,7 @@ async def main_async():
         print(f"{bcolors.OKGREEN}Server shutdown complete.{bcolors.ENDC}")
 
 async def shutdown_procedure():
-    global stop_recorder, recorder_thread, control_server, data_server, wav_file
+    global stop_recorder, recorder_thread, control_server, data_server, wav_file, health_check_runner
     
     # Close WebSocket servers first
     if 'control_server' in globals() and control_server:
