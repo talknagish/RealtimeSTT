@@ -276,27 +276,27 @@ def text_detected(text, loop):
             recorder.post_speech_silence_duration = global_args.unknown_sentence_detection_pause
 
 
-        # Append the new text with its timestamp
-        current_time = time.time()
-        text_time_deque.append((current_time, text))
+        # # Append the new text with its timestamp
+        # current_time = time.time()
+        # text_time_deque.append((current_time, text))
 
-        # Remove texts older than hard_break_even_on_background_noise seconds
-        while text_time_deque and text_time_deque[0][0] < current_time - hard_break_even_on_background_noise:
-            text_time_deque.popleft()
+        # # Remove texts older than hard_break_even_on_background_noise seconds
+        # while text_time_deque and text_time_deque[0][0] < current_time - hard_break_even_on_background_noise:
+        #     text_time_deque.popleft()
 
-        # Check if at least hard_break_even_on_background_noise_min_texts texts have arrived within the last hard_break_even_on_background_noise seconds
-        if len(text_time_deque) >= hard_break_even_on_background_noise_min_texts:
-            texts = [t[1] for t in text_time_deque]
-            first_text = texts[0]
-            last_text = texts[-1]
+        # # Check if at least hard_break_even_on_background_noise_min_texts texts have arrived within the last hard_break_even_on_background_noise seconds
+        # if len(text_time_deque) >= hard_break_even_on_background_noise_min_texts:
+        #     texts = [t[1] for t in text_time_deque]
+        #     first_text = texts[0]
+        #     last_text = texts[-1]
 
-            # Compute the similarity ratio between the first and last texts
-            similarity = SequenceMatcher(None, first_text, last_text).ratio()
+        #     # Compute the similarity ratio between the first and last texts
+        #     similarity = SequenceMatcher(None, first_text, last_text).ratio()
 
-            if similarity > hard_break_even_on_background_noise_min_similarity and len(first_text) > hard_break_even_on_background_noise_min_chars:
-                recorder.stop()
-                recorder.clear_audio_queue()
-                prev_text = ""
+        #     if similarity > hard_break_even_on_background_noise_min_similarity and len(first_text) > hard_break_even_on_background_noise_min_chars:
+        #         recorder.stop()
+        #         recorder.clear_audio_queue()
+        #         prev_text = ""
 
     prev_text = text
 
