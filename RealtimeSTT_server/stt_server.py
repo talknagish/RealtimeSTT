@@ -195,8 +195,8 @@ allowed_parameters = [
 # Queues and connections for control and data
 control_connections = set()
 data_connections = set()
-control_queue = asyncio.Queue()
-audio_queue = asyncio.Queue()
+control_queue = None
+audio_queue = None
 
 def preprocess_text(text):
     # Remove leading whitespaces
@@ -788,12 +788,16 @@ def make_callback(loop, callback):
     return inner_callback
 
 async def main_async():            
-    global stop_recorder, recorder_config, global_args, control_server, data_server
+    global stop_recorder, recorder_config, global_args, control_server, data_server, control_queue, audio_queue
     args = parse_arguments()
     global_args = args
 
     # Get the event loop here and pass it to the recorder thread
     loop = asyncio.get_event_loop()
+    
+    # Initialize asyncio queues within the event loop context
+    control_queue = asyncio.Queue()
+    audio_queue = asyncio.Queue()
 
     recorder_config = {
         'model': args.model,
