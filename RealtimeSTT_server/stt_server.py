@@ -798,6 +798,25 @@ def make_callback(loop, callback):
         callback(*args, **kwargs, loop=loop)
     return inner_callback
 
+class HealthCheckProtocol(websockets.WebSocketServerProtocol):
+    """
+    Custom protocol that handles health check connections gracefully.
+    """
+    async def process_request(self, path, headers):
+        try:
+            # Check if this is a simple TCP connection (no headers or invalid headers)
+            if not headers or 'upgrade' not in [k.lower() for k in headers.keys()]:
+                # This is likely a health check - return a simple HTTP response
+                debug_print(f"Health check connection detected via process_request")
+                return (200, [('Content-Type', 'text/plain')], b'OK')
+            
+            # If it looks like a proper WebSocket request, let it proceed
+            return None
+        except Exception as e:
+            # If there's any error parsing headers, treat it as a health check
+            debug_print(f"Health check connection detected via process_request: {e}")
+            return (200, [('Content-Type', 'text/plain')], b'OK')
+
 async def handle_websocket_request(path, headers):
     """
     Handle WebSocket requests and catch handshake errors.
@@ -958,13 +977,13 @@ async def main_async():
                 HealthCheckWebSocketServer(control_handler, "control"), 
                 "0.0.0.0", 
                 args.control,
-                process_request=handle_websocket_request
+                create_protocol=HealthCheckProtocol
             )
             data_server = await websockets.serve(
                 HealthCheckWebSocketServer(data_handler, "data"), 
                 "0.0.0.0", 
                 args.data,
-                process_request=handle_websocket_request
+                create_protocol=HealthCheckProtocol
             )
             print(f"{bcolors.OKGREEN}Control server started on {bcolors.OKBLUE}ws://0.0.0.0:{args.control}{bcolors.ENDC}")
             print(f"{bcolors.OKGREEN}Data server started on {bcolors.OKBLUE}ws://0.0.0.0:{args.data}{bcolors.ENDC}")
