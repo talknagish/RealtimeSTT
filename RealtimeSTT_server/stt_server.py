@@ -642,7 +642,7 @@ def decode_and_resample(
 
     return resampled_audio.astype(np.int16).tobytes()
 
-async def control_handler(websocket, path):
+async def control_handler(websocket):
     debug_print(f"New control connection from {websocket.remote_address}")
     print(f"{bcolors.OKGREEN}Control client connected{bcolors.ENDC}")
     global recorder
@@ -744,7 +744,7 @@ async def control_handler(websocket, path):
     finally:
         control_connections.remove(websocket)
 
-async def data_handler(websocket, path):
+async def data_handler(websocket):
     global writechunks, wav_file
     print(f"{bcolors.OKGREEN}Data client connected{bcolors.ENDC}")
     data_connections.add(websocket)
