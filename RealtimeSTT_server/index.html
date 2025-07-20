@@ -114,6 +114,10 @@
     let audioContext;
     let mediaStream;
     let mediaProcessor;
+    let reconnectAttempts = 0;
+    let maxReconnectAttempts = 5;
+    let reconnectDelay = 1000; // 1 second
+    let isRecording = false;
 
     // Connect to the data WebSocket
     function connectToDataSocket() {
@@ -122,6 +126,7 @@
       dataSocket.onopen = () => {
         statusDiv.textContent = "Connected to STT server.";
         console.log("Connected to data WebSocket.");
+        reconnectAttempts = 0; // Reset reconnection attempts on successful connection
       };
 
       dataSocket.onmessage = (event) => {
@@ -160,6 +165,19 @@
       dataSocket.onclose = (event) => {
         console.log("WebSocket closed:", event.code, event.reason);
         statusDiv.textContent = "Disconnected from STT server.";
+        
+        // Attempt to reconnect if we're still recording
+        if (isRecording && reconnectAttempts < maxReconnectAttempts) {
+          console.log(`Attempting to reconnect... (${reconnectAttempts + 1}/${maxReconnectAttempts})`);
+          statusDiv.textContent = `Reconnecting... (${reconnectAttempts + 1}/${maxReconnectAttempts})`;
+          setTimeout(() => {
+            reconnectAttempts++;
+            connectToDataSocket();
+          }, reconnectDelay);
+        } else if (reconnectAttempts >= maxReconnectAttempts) {
+          statusDiv.textContent = "Failed to reconnect after multiple attempts. Please restart recording.";
+          console.log("Max reconnection attempts reached");
+        }
       };
 
       dataSocket.onerror = (error) => {
@@ -176,6 +194,8 @@
         statusDiv.textContent = "Recording...";
         transcriptionDiv.textContent = "";
         fullTextDiv.textContent = "";
+        isRecording = true;
+        reconnectAttempts = 0;
 
         audioContext = new AudioContext();
         mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -210,6 +230,8 @@
         mediaStream.getTracks().forEach(track => track.stop());
       }
 
+      isRecording = false;
+      
       if (dataSocket) {
         dataSocket.close();
       }

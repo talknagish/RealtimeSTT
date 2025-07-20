@@ -732,6 +732,7 @@ async def data_handler(websocket):
     global writechunks, wav_file
     print(f"{bcolors.OKGREEN}Data client connected{bcolors.ENDC}")
     data_connections.add(websocket)
+    print(f"{bcolors.OKCYAN}[DEBUG] Total data connections: {len(data_connections)}{bcolors.ENDC}")
     try:
         while True:
             message = await websocket.recv()
@@ -778,11 +779,13 @@ async def data_handler(websocket):
         print(f"{bcolors.WARNING}Data client disconnected: {e}{bcolors.ENDC}")
     finally:
         data_connections.discard(websocket)
+        print(f"{bcolors.OKCYAN}[DEBUG] Total data connections after disconnect: {len(data_connections)}{bcolors.ENDC}")
         # recorder.clear_audio_queue()  # This was interfering with recorder state
 
 async def broadcast_audio_messages():
     while True:
         message = await audio_queue.get()
+        print(f"{bcolors.OKCYAN}[DEBUG] Broadcasting message to {len(data_connections)} connections{bcolors.ENDC}")
         for conn in list(data_connections):
             try:
                 timestamp = datetime.now().strftime('%H:%M:%S.%f')[:-3]
@@ -790,7 +793,9 @@ async def broadcast_audio_messages():
                 if extended_logging:
                     print(f"  [{timestamp}] Sending message: {bcolors.OKBLUE}{message}{bcolors.ENDC}\n", flush=True, end="")
                 await conn.send(message)
+                print(f"{bcolors.OKGREEN}[DEBUG] Successfully sent message to connection{bcolors.ENDC}")
             except websockets.exceptions.ConnectionClosed as e:
+                print(f"{bcolors.WARNING}[DEBUG] Connection closed while sending: {e}{bcolors.ENDC}")
                 data_connections.discard(conn)
             except Exception as e:
                 print(f"{bcolors.FAIL}[DEBUG] Error sending message: {e}{bcolors.ENDC}")
