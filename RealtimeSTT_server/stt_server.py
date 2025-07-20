@@ -583,7 +583,7 @@ def _recorder_thread(loop):
     
     def process_text(full_sentence):
         global prev_text
-        prev_text = ""
+        # prev_text = ""
         full_sentence = preprocess_text(full_sentence)
         message = json.dumps({
             'type': 'fullSentence',
