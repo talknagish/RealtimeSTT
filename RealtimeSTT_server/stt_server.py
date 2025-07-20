@@ -603,7 +603,9 @@ def _recorder_thread(loop):
             print(f"\r[{timestamp}] {bcolors.BOLD}Sentence:{bcolors.ENDC} {bcolors.OKGREEN}{full_sentence}{bcolors.ENDC}\n")
     try:
         while not stop_recorder:
+            print(f"{bcolors.OKCYAN}[DEBUG] Recorder thread waiting for audio...{bcolors.ENDC}")
             recorder.text(process_text)
+            print(f"{bcolors.OKCYAN}[DEBUG] Recorder.text() returned, continuing loop{bcolors.ENDC}")
     except KeyboardInterrupt:
         print(f"{bcolors.WARNING}Exiting application due to keyboard interrupt{bcolors.ENDC}")
     except Exception as e:
@@ -730,6 +732,7 @@ async def control_handler(websocket):
 async def data_handler(websocket):
     global writechunks, wav_file
     print(f"{bcolors.OKGREEN}Data client connected{bcolors.ENDC}")
+    print(f"{bcolors.OKBLUE}[DEBUG] New data client connected, total connections: {len(data_connections) + 1}{bcolors.ENDC}")
     data_connections.add(websocket)
     try:
         while True:
@@ -764,6 +767,7 @@ async def data_handler(websocket):
 
                     wav_file.writeframes(chunk)
 
+                print(f"{bcolors.OKCYAN}[DEBUG] Feeding audio chunk to recorder (size: {len(chunk)} bytes){bcolors.ENDC}")
                 if sample_rate != 16000:
                     resampled_chunk = decode_and_resample(chunk, sample_rate, 16000)
                     if extended_logging:
@@ -771,12 +775,14 @@ async def data_handler(websocket):
                     recorder.feed_audio(resampled_chunk)
                 else:
                     recorder.feed_audio(chunk)
+                print(f"{bcolors.OKGREEN}[DEBUG] Audio chunk fed to recorder successfully{bcolors.ENDC}")
             else:
                 print(f"{bcolors.WARNING}Received non-binary message on data connection{bcolors.ENDC}")
     except websockets.exceptions.ConnectionClosed as e:
         print(f"{bcolors.WARNING}Data client disconnected: {e}{bcolors.ENDC}")
     finally:
         data_connections.remove(websocket)
+        print(f"{bcolors.OKBLUE}[DEBUG] Data client removed, total connections: {len(data_connections)}{bcolors.ENDC}")
         # recorder.clear_audio_queue()  # This was interfering with recorder state
 
 async def broadcast_audio_messages():

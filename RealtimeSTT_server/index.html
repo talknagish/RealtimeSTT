@@ -125,10 +125,13 @@
       };
 
       dataSocket.onmessage = (event) => {
+        console.log("Received message:", event.data);
         try {
           const message = JSON.parse(event.data);
+          console.log("Parsed message:", message);
 
           if (message.type === "realtime") {
+            console.log("Processing realtime message:", message.text);
             // Show real-time transcription with the last word in bold, orange
             let words = message.text.split(" ");
             let lastWord = words.pop();
@@ -138,6 +141,7 @@
             const transcriptionContainer = document.getElementById("transcriptionContainer");
             transcriptionContainer.scrollTop = transcriptionContainer.scrollHeight;
           } else if (message.type === "fullSentence") {
+            console.log("Processing fullSentence message:", message.text);
             // Accumulate the final transcription in green
             fullTextDiv.innerHTML += message.text + " ";
             transcriptionDiv.innerHTML = message.text;
@@ -145,13 +149,16 @@
             // Scroll to the bottom of fullTextContainer when new text is added
             const fullTextContainer = document.getElementById("fullTextContainer");
             fullTextContainer.scrollTop = fullTextContainer.scrollHeight;
+          } else {
+            console.log("Ignoring message type:", message.type);
           }
         } catch (e) {
           console.error("Error parsing message:", e);
         }
       };
 
-      dataSocket.onclose = () => {
+      dataSocket.onclose = (event) => {
+        console.log("WebSocket closed:", event.code, event.reason);
         statusDiv.textContent = "Disconnected from STT server.";
       };
 
