@@ -598,21 +598,9 @@ def _recorder_thread(loop):
             print(f"  [{timestamp}] Full text: {bcolors.BOLD}Sentence:{bcolors.ENDC} {bcolors.OKGREEN}{full_sentence}{bcolors.ENDC}\n", flush=True, end="")
         else:
             print(f"\r[{timestamp}] {bcolors.BOLD}Sentence:{bcolors.ENDC} {bcolors.OKGREEN}{full_sentence}{bcolors.ENDC}\n")
-        
-        # Debug: Print recorder state after full sentence
-        print(f"{bcolors.OKBLUE}[DEBUG] Full sentence processed, recorder state check...{bcolors.ENDC}")
-        
-        # Try to reset recorder state to prevent getting stuck
-        try:
-            recorder.clear_audio_queue()
-            print(f"{bcolors.OKGREEN}[DEBUG] Audio queue cleared after full sentence{bcolors.ENDC}")
-        except Exception as e:
-            print(f"{bcolors.WARNING}[DEBUG] Error clearing audio queue: {e}{bcolors.ENDC}")
     try:
         while not stop_recorder:
-            print(f"{bcolors.OKCYAN}[DEBUG] Recorder thread loop iteration{bcolors.ENDC}")
             recorder.text(process_text)
-            print(f"{bcolors.OKCYAN}[DEBUG] Recorder.text() returned, continuing loop{bcolors.ENDC}")
     except KeyboardInterrupt:
         print(f"{bcolors.WARNING}Exiting application due to keyboard interrupt{bcolors.ENDC}")
     except Exception as e:
@@ -786,7 +774,7 @@ async def data_handler(websocket):
         print(f"{bcolors.WARNING}Data client disconnected: {e}{bcolors.ENDC}")
     finally:
         data_connections.remove(websocket)
-        recorder.clear_audio_queue()  # Ensure audio queue is cleared if client disconnects
+        # recorder.clear_audio_queue()  # This was interfering with recorder state
 
 async def broadcast_audio_messages():
     while True:
