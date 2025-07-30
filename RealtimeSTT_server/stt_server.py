@@ -256,6 +256,12 @@ class HybridRecorderManager:
         # Thread-safe callback queue
         self.callback_queue = queue.Queue()
         
+        # State management to prevent stuck loops
+        self.last_processed_text = ""
+        self.text_repeat_count = 0
+        self.max_text_repeats = 3
+        self.processing_state = "idle"  # idle, processing, stuck
+        
     async def initialize(self):
         """Initialize the recorder in a separate thread"""
         try:
@@ -297,8 +303,40 @@ class HybridRecorderManager:
     def _recorder_thread_worker(self):
         """Worker thread for the recorder - runs the blocking recorder operations"""
         try:
-            # Create recorder in this thread
+            # Create thread-safe callback wrappers
+            def thread_safe_text_detected(text):
+                # Queue the callback for async processing instead of calling directly
+                self.callback_queue.put((text_detected_async, (text, self.loop), {}))
+            
+            def thread_safe_on_recording_start():
+                self.callback_queue.put((on_recording_start_async, (self.loop,), {}))
+                
+            def thread_safe_on_recording_stop():
+                self.callback_queue.put((on_recording_stop_async, (self.loop,), {}))
+                
+            def thread_safe_on_vad_detect_start():
+                self.callback_queue.put((on_vad_detect_start_async, (self.loop,), {}))
+                
+            def thread_safe_on_vad_detect_stop():
+                self.callback_queue.put((on_vad_detect_stop_async, (self.loop,), {}))
+                
+            def thread_safe_on_turn_detection_start():
+                self.callback_queue.put((on_turn_detection_start_async, (self.loop,), {}))
+                
+            def thread_safe_on_turn_detection_stop():
+                self.callback_queue.put((on_turn_detection_stop_async, (self.loop,), {}))
+            
+            # Create recorder in this thread first
             self.recorder = AudioToTextRecorder(**self.config)
+            
+            # Override the callback methods with thread-safe versions
+            self.recorder.on_recording_start = thread_safe_on_recording_start
+            self.recorder.on_recording_stop = thread_safe_on_recording_stop
+            self.recorder.on_vad_detect_start = thread_safe_on_vad_detect_start
+            self.recorder.on_vad_detect_stop = thread_safe_on_vad_detect_stop
+            self.recorder.on_turn_detection_start = thread_safe_on_turn_detection_start
+            self.recorder.on_turn_detection_stop = thread_safe_on_turn_detection_stop
+            self.recorder.on_realtime_transcription_update = thread_safe_text_detected
             
             # Add reset method to recorder object
             def reset_recorder_state_method():
@@ -309,7 +347,7 @@ class HybridRecorderManager:
             # Signal that recorder is ready
             self.recorder_ready.set()
             
-            # Main processing loop
+            # Main processing loop with thread-safe text processing
             def process_text(full_sentence):
                 # Put result in queue for async processing
                 self.result_queue.put(('full_sentence', full_sentence))
@@ -326,6 +364,7 @@ class HybridRecorderManager:
                         print(f"{bcolors.WARNING}[DEBUG] Recorder watchdog timeout, clearing audio queue{bcolors.ENDC}")
                         try:
                             self.recorder.clear_audio_queue()
+                            self._reset_recorder_state()
                         except Exception as e:
                             print(f"{bcolors.WARNING}[DEBUG] Error clearing audio queue: {e}{bcolors.ENDC}")
                         last_processing_time = current_time
@@ -374,6 +413,11 @@ class HybridRecorderManager:
                             recorder_health.record_error()
                             await self._attempt_recovery()
                         self._last_activity_check = current_time
+                
+                # Check if recorder is in stuck state (duplicate text detection)
+                if self.processing_state == "stuck":
+                    print(f"{bcolors.FAIL}[DEBUG] Recorder in stuck state, triggering recovery{bcolors.ENDC}")
+                    await self._attempt_recovery()
                     
                 # Process any results from the recorder thread
                 await self._process_recorder_results()
@@ -436,6 +480,10 @@ class HybridRecorderManager:
             if self.recorder:
                 await asyncio.to_thread(self.recorder.clear_audio_queue)
                 self._reset_recorder_state()
+                # Reset state management
+                self.last_processed_text = ""
+                self.text_repeat_count = 0
+                self.processing_state = "idle"
             
             recorder_health.record_success()
             print(f"{bcolors.OKGREEN}[DEBUG] Recorder recovery successful{bcolors.ENDC}")
@@ -457,6 +505,11 @@ class HybridRecorderManager:
         if not self.recorder or recorder_health.state == RecorderState.ERROR:
             return
         
+        # Check if recorder is in a stuck state
+        if self.processing_state == "stuck":
+            print(f"{bcolors.WARNING}[DEBUG] Recorder is stuck, skipping audio processing{bcolors.ENDC}")
+            return
+        
         try:
             # Put audio in queue for recorder thread
             self.audio_queue.put(audio_data)
@@ -465,6 +518,10 @@ class HybridRecorderManager:
             await asyncio.to_thread(self.recorder.feed_audio, audio_data)
             server_metrics.audio_chunks_processed += 1
             server_metrics.reset_activity()
+            
+            # Update processing state
+            if self.processing_state == "idle":
+                self.processing_state = "processing"
                 
         except Exception as e:
             print(f"{bcolors.FAIL}[ERROR] Error processing audio: {e}{bcolors.ENDC}")
@@ -491,6 +548,11 @@ class HybridRecorderManager:
             # Reset only the text variable, not the entire recorder state
             global prev_text
             prev_text = ""
+            
+            # Reset processing state after sentence completion
+            self.processing_state = "idle"
+            self.text_repeat_count = 0
+            self.last_processed_text = ""
             
         except Exception as e:
             print(f"{bcolors.FAIL}[ERROR] Error handling full sentence: {e}{bcolors.ENDC}")
@@ -619,6 +681,24 @@ async def text_detected_async(text, loop):
     print(f"{bcolors.OKCYAN}[DEBUG] text_detected called with: '{text}'{bcolors.ENDC}")
 
     text = preprocess_text(text)
+    
+    # Check for duplicate text to prevent stuck loops
+    if recorder_manager:
+        if text == recorder_manager.last_processed_text:
+            recorder_manager.text_repeat_count += 1
+            print(f"{bcolors.WARNING}[DEBUG] Duplicate text detected (count: {recorder_manager.text_repeat_count}): '{text}'{bcolors.ENDC}")
+            
+            # If we're getting too many repeats, trigger recovery
+            if recorder_manager.text_repeat_count >= recorder_manager.max_text_repeats:
+                print(f"{bcolors.FAIL}[DEBUG] Too many text repeats, triggering recovery{bcolors.ENDC}")
+                recorder_manager.processing_state = "stuck"
+                # Don't send the duplicate message
+                return
+        else:
+            # Reset repeat count for new text
+            recorder_manager.text_repeat_count = 0
+            recorder_manager.last_processed_text = text
+            recorder_manager.processing_state = "processing"
     
     # Update metrics
     server_metrics.reset_activity()
