@@ -119,35 +119,84 @@
     let reconnectDelay = 1000; // 1 second
     let isRecording = false;
 
+    let isReconnecting = false;
+    let reconnectTimeout = null;
+
     // Connect to the data WebSocket
-    function connectToDataSocket() {
+    async function connectToDataSocket() {
+      if (isReconnecting) {
+        console.log("Already attempting to reconnect, skipping...");
+        return;
+      }
+
+      isReconnecting = true;
+      
+      // Clear any existing reconnect timeout
+      if (reconnectTimeout) {
+        clearTimeout(reconnectTimeout);
+        reconnectTimeout = null;
+      }
+
       // Close existing socket if it exists
       if (dataSocket) {
         try {
-          dataSocket.close();
+          dataSocket.close(1000, "Intentional disconnect");
+          // Wait for socket to close
+          await new Promise(resolve => setTimeout(resolve, 100));
         } catch (e) {
           console.warn("Error closing existing socket:", e);
         }
+        dataSocket = null;
       }
 
       // Clear transcription displays before reconnecting
       transcriptionDiv.textContent = "";
       fullTextDiv.textContent = "";
 
-      dataSocket = new WebSocket(dataURL);
-
-      dataSocket.onopen = () => {
-        statusDiv.textContent = "Connected to STT server.";
-        console.log("Connected to data WebSocket.");
-        reconnectAttempts = 0; // Reset reconnection attempts on successful connection
+      try {
+        dataSocket = new WebSocket(dataURL);
         
-        // Small delay before starting to send audio again
-        setTimeout(() => {
-          if (isRecording) {
-            statusDiv.textContent = "Resuming transcription...";
+        // Set a connection timeout
+        const connectionTimeout = setTimeout(() => {
+          if (dataSocket && dataSocket.readyState === WebSocket.CONNECTING) {
+            console.warn("Connection timeout, closing socket");
+            dataSocket.close();
           }
-        }, 500);
-      };
+        }, 5000);
+
+        dataSocket.onopen = () => {
+          clearTimeout(connectionTimeout);
+          statusDiv.textContent = "Connected to STT server.";
+          console.log("Connected to data WebSocket.");
+          reconnectAttempts = 0;
+          isReconnecting = false;
+          
+          // Wait for server ready status
+          let readyTimeout = setTimeout(() => {
+            if (isRecording) {
+              statusDiv.textContent = "Resuming transcription...";
+            }
+          }, 1000);
+
+          // Clear timeout if we get a ready status message
+          const originalOnMessage = dataSocket.onmessage;
+          const tempHandler = (event) => {
+            try {
+              const message = JSON.parse(event.data);
+              if (message.type === "status" && message.status === "ready") {
+                clearTimeout(readyTimeout);
+                if (isRecording) {
+                  statusDiv.textContent = "Resuming transcription...";
+                }
+                // Restore original message handler
+                dataSocket.onmessage = originalOnMessage;
+              }
+            } catch (e) {
+              console.warn("Error parsing message in temp handler:", e);
+            }
+          };
+          dataSocket.onmessage = tempHandler;
+        };
 
       dataSocket.onmessage = (event) => {
         console.log("Received message:", event.data);
@@ -182,21 +231,66 @@
         }
       };
 
-      dataSocket.onclose = (event) => {
+      dataSocket.onclose = async (event) => {
         console.log("WebSocket closed:", event.code, event.reason);
-        statusDiv.textContent = "Disconnected from STT server.";
+        
+        // Don't attempt reconnect if we're intentionally closing
+        if (event.code === 1000 && event.reason === "Intentional disconnect") {
+          console.log("Intentional disconnect, not attempting reconnect");
+          statusDiv.textContent = "Disconnected from STT server.";
+          isReconnecting = false;
+          return;
+        }
+        
+        // Handle 1005 errors specifically
+        if (event.code === 1005) {
+          console.log("Received 1005 error, performing full reset before reconnect");
+          // Wait a bit longer before reconnecting on 1005 errors
+          await new Promise(resolve => setTimeout(resolve, 1000));
+          
+          // Reset all audio processing
+          if (mediaProcessor && audioContext) {
+            try {
+              mediaProcessor.disconnect();
+              await audioContext.close();
+              mediaProcessor = null;
+              audioContext = null;
+            } catch (e) {
+              console.warn("Error resetting audio processing:", e);
+            }
+          }
+        }
+        
+        statusDiv.textContent = "Connection lost. Attempting to reconnect...";
         
         // Attempt to reconnect if we're still recording
         if (isRecording && reconnectAttempts < maxReconnectAttempts) {
           console.log(`Attempting to reconnect... (${reconnectAttempts + 1}/${maxReconnectAttempts})`);
           statusDiv.textContent = `Reconnecting... (${reconnectAttempts + 1}/${maxReconnectAttempts})`;
-          setTimeout(() => {
+          
+          // Exponential backoff for reconnect delay
+          const currentDelay = reconnectDelay * Math.pow(1.5, reconnectAttempts);
+          
+          reconnectTimeout = setTimeout(async () => {
             reconnectAttempts++;
-            connectToDataSocket();
-          }, reconnectDelay);
+            try {
+              // Reinitialize audio context if needed
+              if (!audioContext || audioContext.state === 'closed') {
+                audioContext = new AudioContext();
+                await setupAudioProcessing();
+              }
+              await connectToDataSocket();
+            } catch (e) {
+              console.error("Error during reconnect:", e);
+              statusDiv.textContent = "Error reconnecting. Please try again.";
+            }
+          }, currentDelay);
         } else if (reconnectAttempts >= maxReconnectAttempts) {
-          statusDiv.textContent = "Failed to reconnect after multiple attempts. Please restart recording.";
+          statusDiv.textContent = "Failed to reconnect. Please stop and restart recording.";
           console.log("Max reconnection attempts reached");
+          isRecording = false;
+          startButton.disabled = false;
+          stopButton.disabled = true;
         }
       };
 
@@ -206,32 +300,50 @@
       };
     }
 
+    // Set up audio processing
+    async function setupAudioProcessing() {
+      if (!audioContext) {
+        audioContext = new AudioContext();
+      }
+      
+      if (!mediaStream) {
+        mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      }
+      
+      const input = audioContext.createMediaStreamSource(mediaStream);
+      
+      // Set up processor for audio chunks
+      mediaProcessor = audioContext.createScriptProcessor(1024, 1, 1);
+      mediaProcessor.onaudioprocess = (event) => {
+        if (isRecording && dataSocket && dataSocket.readyState === WebSocket.OPEN) {
+          const audioData = event.inputBuffer.getChannelData(0);
+          sendAudioChunk(audioData, audioContext.sampleRate);
+        }
+      };
+      
+      input.connect(mediaProcessor);
+      mediaProcessor.connect(audioContext.destination);
+      
+      return true;
+    }
+
     // Start recording audio from the microphone
     async function startRecording() {
       try {
         startButton.disabled = true;
         stopButton.disabled = false;
-        statusDiv.textContent = "Recording...";
+        statusDiv.textContent = "Initializing...";
         transcriptionDiv.textContent = "";
         fullTextDiv.textContent = "";
         isRecording = true;
         reconnectAttempts = 0;
-
-        audioContext = new AudioContext();
-        mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        const input = audioContext.createMediaStreamSource(mediaStream);
-
-        // Set up processor for audio chunks
-        mediaProcessor = audioContext.createScriptProcessor(1024, 1, 1);
-        mediaProcessor.onaudioprocess = (event) => {
-          const audioData = event.inputBuffer.getChannelData(0);
-          sendAudioChunk(audioData, audioContext.sampleRate);
-        };
-
-        input.connect(mediaProcessor);
-        mediaProcessor.connect(audioContext.destination);
-
-        connectToDataSocket();
+        
+        // Initialize audio processing
+        await setupAudioProcessing();
+        
+        // Connect to WebSocket only after audio is set up
+        statusDiv.textContent = "Connecting to server...";
+        await connectToDataSocket();
       } catch (error) {
         console.error("Error accessing microphone:", error);
         statusDiv.textContent = "Error accessing microphone.";

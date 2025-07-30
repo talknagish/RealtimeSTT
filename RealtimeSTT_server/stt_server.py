@@ -1183,51 +1183,86 @@ async def control_handler(websocket):
         reset_recorder_state()
 
 async def data_handler(websocket):
-    global writechunks, wav_file, server_metrics, recorder_manager
+    global writechunks, wav_file, server_metrics, recorder_manager, prev_text
     print(f"{bcolors.OKGREEN}Data client connected{bcolors.ENDC}")
     
     # Track connection metrics
     server_metrics.active_connections += 1
     server_metrics.total_connections += 1
     
-    # Clean up any stale connections first
-    stale_connections = set()
-    for conn in data_connections:
+    # Force cleanup of all existing connections
+    for conn in list(data_connections):
         try:
-            await conn.ping()
-        except:
-            stale_connections.add(conn)
-    for conn in stale_connections:
+            await conn.close(1000, "New connection taking over")
+        except Exception as e:
+            print(f"{bcolors.WARNING}[DEBUG] Error closing existing connection: {e}{bcolors.ENDC}")
         data_connections.discard(conn)
     
+    # Clear all connection references
+    data_connections.clear()
+    connection_refs.clear()
+    
+    # Add new connection
     data_connections.add(websocket)
     connection_refs.add(weakref.ref(websocket))
-    print(f"{bcolors.OKCYAN}[DEBUG] Total data connections after cleanup: {len(data_connections)}{bcolors.ENDC}")
+    print(f"{bcolors.OKCYAN}[DEBUG] New data connection established. Total connections: {len(data_connections)}{bcolors.ENDC}")
     
-    # Perform a full state reset for the new connection
+    # Perform a complete recorder reset
     try:
         if recorder_manager:
-            # Stop any ongoing processing
-            await recorder_manager.recorder.clear_audio_queue()
+            print(f"{bcolors.OKBLUE}[DEBUG] Starting complete recorder reset...{bcolors.ENDC}")
+            
+            # Stop all ongoing processing
+            recorder_manager.stop_recorder = True
+            await asyncio.sleep(0.1)  # Give time for processing to stop
+            recorder_manager.stop_recorder = False
+            
+            # Reset all state variables
             recorder_manager.processing_state = "idle"
             recorder_manager.text_repeat_count = 0
             recorder_manager.last_processed_text = ""
+            prev_text = ""  # Reset global prev_text
             
-            # Reset the recorder's internal state
-            await asyncio.to_thread(recorder_manager.recorder.reset_recorder_state)
-            
-            # Clear any pending messages in queues
+            # Clear all queues
+            await recorder_manager.recorder.clear_audio_queue()
             while not recorder_manager.audio_queue.empty():
                 try:
                     recorder_manager.audio_queue.get_nowait()
                 except queue.Empty:
                     break
+                    
+            while not recorder_manager.result_queue.empty():
+                try:
+                    recorder_manager.result_queue.get_nowait()
+                except queue.Empty:
+                    break
+                    
+            while not recorder_manager.callback_queue.empty():
+                try:
+                    recorder_manager.callback_queue.get_nowait()
+                except queue.Empty:
+                    break
             
-            print(f"{bcolors.OKGREEN}[DEBUG] Successfully reset recorder state for new connection{bcolors.ENDC}")
+            # Reset recorder's internal state
+            await asyncio.to_thread(recorder_manager.recorder.reset_recorder_state)
+            
+            # Reset health monitoring state
+            recorder_health.state = RecorderState.READY
+            recorder_health.consecutive_errors = 0
+            recorder_health.recovery_attempts = 0
+            
+            print(f"{bcolors.OKGREEN}[DEBUG] Complete recorder reset successful{bcolors.ENDC}")
     except Exception as e:
-        print(f"{bcolors.WARNING}[DEBUG] Error during connection state reset: {e}{bcolors.ENDC}")
+        print(f"{bcolors.FAIL}[ERROR] Failed to reset recorder state: {e}{bcolors.ENDC}")
+        recorder_health.record_error()
     
     try:
+        # Send initial ready state to client
+        try:
+            await websocket.send(json.dumps({"type": "status", "status": "ready"}))
+        except Exception as e:
+            print(f"{bcolors.WARNING}[DEBUG] Error sending ready status: {e}{bcolors.ENDC}")
+        
         while True:
             message = await websocket.recv()
             if isinstance(message, bytes):
