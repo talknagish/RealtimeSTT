@@ -91,6 +91,8 @@ import weakref
 from typing import Dict, Set, Optional, Any
 from dataclasses import dataclass, field
 from enum import Enum
+import queue
+import threading
 
 # Production-ready metrics and monitoring
 @dataclass
@@ -225,42 +227,46 @@ from websockets.asyncio.server import serve
 from websockets.exceptions import ConnectionClosed
 import aiohttp
 from aiohttp import web
-import threading
 import logging
 import wave
 import json
 
-# Production-ready async recorder manager
-class AsyncRecorderManager:
-    """Async wrapper for the recorder with production-ready error handling and recovery"""
+# Production-ready hybrid recorder manager (thread-based recorder with async communication)
+class HybridRecorderManager:
+    """Hybrid recorder manager with thread-based recorder and async communication"""
     
     def __init__(self, config: dict, loop: asyncio.AbstractEventLoop):
         self.config = config
         self.loop = loop
         self.recorder: Optional[AudioToTextRecorder] = None
-        self.recorder_task: Optional[asyncio.Task] = None
+        self.recorder_thread: Optional[threading.Thread] = None
         self.health_task: Optional[asyncio.Task] = None
         self.ready_event = asyncio.Event()
         self.shutdown_event = asyncio.Event()
         self.error_event = asyncio.Event()
         self.processing_lock = asyncio.Lock()
+        self.recorder_ready = threading.Event()
+        self.stop_recorder = False
+        
+        # Thread-safe queues for communication
+        self.audio_queue = queue.Queue()
+        self.result_queue = queue.Queue()
+        self._last_activity_check = time.time()
         
     async def initialize(self):
-        """Initialize the recorder asynchronously"""
+        """Initialize the recorder in a separate thread"""
         try:
             recorder_health.state = RecorderState.INITIALIZING
             print(f"{bcolors.OKGREEN}Initializing production-ready RealtimeSTT server with parameters:{bcolors.ENDC}")
             for key, value in self.config.items():
                 print(f"    {bcolors.OKBLUE}{key}{bcolors.ENDC}: {value}")
             
-            # Initialize recorder in thread to avoid blocking
-            self.recorder = await asyncio.to_thread(self._create_recorder)
+            # Start recorder in separate thread
+            self.recorder_thread = threading.Thread(target=self._recorder_thread_worker, daemon=True)
+            self.recorder_thread.start()
             
-            # Add reset method to recorder object
-            def reset_recorder_state_method():
-                self._reset_recorder_state()
-            
-            self.recorder.reset_recorder_state = reset_recorder_state_method
+            # Wait for recorder to be ready
+            await asyncio.to_thread(self.recorder_ready.wait)
             
             print(f"{bcolors.OKGREEN}{bcolors.BOLD}RealtimeSTT initialized successfully{bcolors.ENDC}")
             recorder_health.record_success()
@@ -275,24 +281,91 @@ class AsyncRecorderManager:
             self.error_event.set()
             raise
     
-    def _create_recorder(self) -> AudioToTextRecorder:
-        """Create the recorder instance"""
-        return AudioToTextRecorder(**self.config)
+    def _recorder_thread_worker(self):
+        """Worker thread for the recorder - runs the blocking recorder operations"""
+        try:
+            # Create recorder in this thread
+            self.recorder = AudioToTextRecorder(**self.config)
+            
+            # Add reset method to recorder object
+            def reset_recorder_state_method():
+                self._reset_recorder_state()
+            
+            self.recorder.reset_recorder_state = reset_recorder_state_method
+            
+            # Signal that recorder is ready
+            self.recorder_ready.set()
+            
+            # Main processing loop
+            def process_text(full_sentence):
+                # Put result in queue for async processing
+                self.result_queue.put(('full_sentence', full_sentence))
+            
+            while not self.stop_recorder:
+                try:
+                    # Process text - this is the blocking operation
+                    self.recorder.text(process_text)
+                    recorder_health.record_success()
+                    server_metrics.reset_activity()
+                    
+                    # Update activity time to prevent stuck detection
+                    if hasattr(self, '_last_activity_check'):
+                        self._last_activity_check = time.time()
+                    
+                except Exception as e:
+                    print(f"{bcolors.FAIL}[ERROR] Recorder thread error: {e}{bcolors.ENDC}")
+                    server_metrics.recorder_errors += 1
+                    recorder_health.record_error()
+                    # Don't sleep, just continue processing
+                    
+        except Exception as e:
+            print(f"{bcolors.FAIL}[ERROR] Failed to create recorder: {e}{bcolors.ENDC}")
+            recorder_health.record_error()
     
     async def _health_monitor(self):
         """Monitor recorder health without blocking"""
+        last_activity_check = time.time()
+        stuck_threshold = 10  # 10 seconds without activity
+        
         while not self.shutdown_event.is_set():
             try:
-                await asyncio.sleep(1)  # Check every second, but don't block processing
+                await asyncio.sleep(1)  # Check every second
                 
                 # Check if recorder is responsive
-                if self.recorder and recorder_health.state == RecorderState.ERROR:
+                if recorder_health.state == RecorderState.ERROR:
                     await self._attempt_recovery()
+                
+                # Check if recorder is stuck (no activity for too long)
+                current_time = time.time()
+                if hasattr(self, '_last_activity_check'):
+                    if current_time - self._last_activity_check > stuck_threshold:
+                        if recorder_health.state == RecorderState.READY:
+                            print(f"{bcolors.WARNING}[DEBUG] Recorder appears stuck, attempting recovery{bcolors.ENDC}")
+                            recorder_health.record_error()
+                            await self._attempt_recovery()
+                        self._last_activity_check = current_time
+                    
+                # Process any results from the recorder thread
+                await self._process_recorder_results()
                     
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 print(f"{bcolors.WARNING}[DEBUG] Health monitor error: {e}{bcolors.ENDC}")
+    
+    async def _process_recorder_results(self):
+        """Process results from the recorder thread"""
+        try:
+            while not self.result_queue.empty():
+                result_type, data = self.result_queue.get_nowait()
+                
+                if result_type == 'full_sentence':
+                    await self._handle_full_sentence(data)
+                    
+        except queue.Empty:
+            pass
+        except Exception as e:
+            print(f"{bcolors.FAIL}[ERROR] Error processing recorder results: {e}{bcolors.ENDC}")
     
     async def _attempt_recovery(self):
         """Attempt to recover from errors without blocking"""
@@ -330,48 +403,18 @@ class AsyncRecorderManager:
             return
         
         try:
-            async with self.processing_lock:
-                await asyncio.to_thread(self.recorder.feed_audio, audio_data)
-                server_metrics.audio_chunks_processed += 1
-                server_metrics.reset_activity()
+            # Put audio in queue for recorder thread
+            self.audio_queue.put(audio_data)
+            
+            # Feed audio to recorder
+            await asyncio.to_thread(self.recorder.feed_audio, audio_data)
+            server_metrics.audio_chunks_processed += 1
+            server_metrics.reset_activity()
                 
         except Exception as e:
             print(f"{bcolors.FAIL}[ERROR] Error processing audio: {e}{bcolors.ENDC}")
             server_metrics.transcription_errors += 1
             recorder_health.record_error()
-    
-    async def start_processing(self):
-        """Start the text processing loop asynchronously"""
-        if not self.recorder:
-            return
-        
-        self.recorder_task = asyncio.create_task(self._processing_loop())
-    
-    async def _processing_loop(self):
-        """Main processing loop without blocking"""
-        def process_text(full_sentence):
-            asyncio.create_task(self._handle_full_sentence(full_sentence))
-        
-        while not self.shutdown_event.is_set():
-            try:
-                # Process text with timeout to prevent blocking
-                await asyncio.wait_for(
-                    asyncio.to_thread(self.recorder.text, process_text),
-                    timeout=1.0  # 1 second timeout
-                )
-                recorder_health.record_success()
-                server_metrics.reset_activity()
-                
-            except asyncio.TimeoutError:
-                # Timeout is normal, continue processing
-                continue
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                print(f"{bcolors.FAIL}[ERROR] Error in processing loop: {e}{bcolors.ENDC}")
-                server_metrics.recorder_errors += 1
-                recorder_health.record_error()
-                # Don't sleep, just continue processing
     
     async def _handle_full_sentence(self, full_sentence: str):
         """Handle full sentence processing asynchronously"""
@@ -400,13 +443,7 @@ class AsyncRecorderManager:
     async def shutdown(self):
         """Graceful shutdown"""
         self.shutdown_event.set()
-        
-        if self.recorder_task:
-            self.recorder_task.cancel()
-            try:
-                await self.recorder_task
-            except asyncio.CancelledError:
-                pass
+        self.stop_recorder = True
         
         if self.health_task:
             self.health_task.cancel()
@@ -420,10 +457,15 @@ class AsyncRecorderManager:
                 await asyncio.to_thread(self.recorder.shutdown)
             except Exception as e:
                 print(f"{bcolors.WARNING}[DEBUG] Error during recorder shutdown: {e}{bcolors.ENDC}")
+        
+        if self.recorder_thread:
+            self.recorder_thread.join(timeout=5)
+            if self.recorder_thread.is_alive():
+                print(f"{bcolors.WARNING}[DEBUG] Recorder thread did not terminate gracefully{bcolors.ENDC}")
 
 # Global variables
 global_args = None
-recorder_manager: Optional[AsyncRecorderManager] = None
+recorder_manager: Optional[HybridRecorderManager] = None
 prev_text = ""
 
 # Define allowed methods and parameters for security
@@ -540,12 +582,15 @@ def text_detected(text, loop):
             return False
 
         if recorder_manager and recorder_manager.recorder:
-            if ends_with_ellipsis(text):
-                recorder_manager.recorder.post_speech_silence_duration = global_args.mid_sentence_detection_pause
-            elif sentence_end(text) and sentence_end(prev_text) and not ends_with_ellipsis(prev_text):
-                recorder_manager.recorder.post_speech_silence_duration = global_args.end_of_sentence_detection_pause
-            else:
-                recorder_manager.recorder.post_speech_silence_duration = global_args.unknown_sentence_detection_pause
+            try:
+                if ends_with_ellipsis(text):
+                    recorder_manager.recorder.post_speech_silence_duration = global_args.mid_sentence_detection_pause
+                elif sentence_end(text) and sentence_end(prev_text) and not ends_with_ellipsis(prev_text):
+                    recorder_manager.recorder.post_speech_silence_duration = global_args.end_of_sentence_detection_pause
+                else:
+                    recorder_manager.recorder.post_speech_silence_duration = global_args.unknown_sentence_detection_pause
+            except Exception as e:
+                print(f"{bcolors.WARNING}[DEBUG] Error updating silence duration: {e}{bcolors.ENDC}")
 
     prev_text = text
 
@@ -887,7 +932,12 @@ async def control_handler(websocket):
                         parameter = command_data.get("parameter")
                         value = command_data.get("value")
                         if parameter in allowed_parameters and hasattr(recorder_manager.recorder, parameter):
-                            setattr(recorder_manager.recorder, parameter, value)
+                            try:
+                                setattr(recorder_manager.recorder, parameter, value)
+                            except Exception as e:
+                                print(f"{bcolors.WARNING}[DEBUG] Error setting parameter {parameter}: {e}{bcolors.ENDC}")
+                                await websocket.send(json.dumps({"status": "error", "message": f"Error setting parameter {parameter}: {e}"}))
+                                continue
                             # Format the value for output
                             if isinstance(value, float):
                                 value_formatted = f"{value:.2f}"
@@ -910,7 +960,12 @@ async def control_handler(websocket):
                         parameter = command_data.get("parameter")
                         request_id = command_data.get("request_id")  # Get the request_id from the command data
                         if parameter in allowed_parameters and hasattr(recorder_manager.recorder, parameter):
-                            value = getattr(recorder_manager.recorder, parameter)
+                            try:
+                                value = getattr(recorder_manager.recorder, parameter)
+                            except Exception as e:
+                                print(f"{bcolors.WARNING}[DEBUG] Error getting parameter {parameter}: {e}{bcolors.ENDC}")
+                                await websocket.send(json.dumps({"status": "error", "message": f"Error getting parameter {parameter}: {e}"}))
+                                continue
                             if isinstance(value, float):
                                 value_formatted = f"{value:.2f}"
                             else:
@@ -939,7 +994,12 @@ async def control_handler(websocket):
                             if method and callable(method):
                                 args = command_data.get("args", [])
                                 kwargs = command_data.get("kwargs", {})
-                                method(*args, **kwargs)
+                                try:
+                                    method(*args, **kwargs)
+                                except Exception as e:
+                                    print(f"{bcolors.WARNING}[DEBUG] Error calling method {method_name}: {e}{bcolors.ENDC}")
+                                    await websocket.send(json.dumps({"status": "error", "message": f"Error calling method {method_name}: {e}"}))
+                                    continue
                                 timestamp = datetime.now().strftime('%H:%M:%S.%f')[:-3]
                                 print(f"  [{timestamp}] {bcolors.OKGREEN}Called method recorder.{bcolors.OKBLUE}{method_name}{bcolors.ENDC}")
                                 await websocket.send(json.dumps({"status": "success", "message": f"Method {method_name} called"}))
@@ -1021,6 +1081,10 @@ async def data_handler(websocket):
                     await recorder_manager.process_audio(resampled_chunk)
                 else:
                     await recorder_manager.process_audio(chunk)
+                
+                # Update heartbeat timer when audio is fed to recorder
+                if 'last_activity_time' in globals():
+                    globals()['last_activity_time'] = time.time()
             else:
                 print(f"{bcolors.WARNING}Received non-binary message on data connection{bcolors.ENDC}")
     except websockets.exceptions.ConnectionClosed as e:
@@ -1176,7 +1240,7 @@ async def main_async():
     # Get the event loop here and pass it to the recorder thread
     loop = asyncio.get_event_loop()
 
-    recorder_manager = AsyncRecorderManager(
+    recorder_manager = HybridRecorderManager(
         {
             'model': args.model,
             'download_root': args.root,
@@ -1270,7 +1334,7 @@ async def main_async():
 
         # Initialize recorder and start processing
         await recorder_manager.initialize()
-        await recorder_manager.start_processing()
+        # The recorder_manager.start_processing() call is now handled by the recorder_thread
         
         # Start production monitoring task
         monitoring_task = asyncio.create_task(production_monitoring())
