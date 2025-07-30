@@ -121,12 +121,32 @@
 
     // Connect to the data WebSocket
     function connectToDataSocket() {
+      // Close existing socket if it exists
+      if (dataSocket) {
+        try {
+          dataSocket.close();
+        } catch (e) {
+          console.warn("Error closing existing socket:", e);
+        }
+      }
+
+      // Clear transcription displays before reconnecting
+      transcriptionDiv.textContent = "";
+      fullTextDiv.textContent = "";
+
       dataSocket = new WebSocket(dataURL);
 
       dataSocket.onopen = () => {
         statusDiv.textContent = "Connected to STT server.";
         console.log("Connected to data WebSocket.");
         reconnectAttempts = 0; // Reset reconnection attempts on successful connection
+        
+        // Small delay before starting to send audio again
+        setTimeout(() => {
+          if (isRecording) {
+            statusDiv.textContent = "Resuming transcription...";
+          }
+        }, 500);
       };
 
       dataSocket.onmessage = (event) => {
@@ -220,25 +240,49 @@
     }
 
     // Stop recording audio and close resources
-    function stopRecording() {
-      if (mediaProcessor && audioContext) {
-        mediaProcessor.disconnect();
-        audioContext.close();
-      }
-
-      if (mediaStream) {
-        mediaStream.getTracks().forEach(track => track.stop());
-      }
-
+    async function stopRecording() {
       isRecording = false;
       
-      if (dataSocket) {
-        dataSocket.close();
+      // Stop audio processing first
+      if (mediaProcessor && audioContext) {
+        try {
+          mediaProcessor.disconnect();
+          await audioContext.close();
+        } catch (e) {
+          console.warn("Error closing audio context:", e);
+        }
       }
 
+      // Stop media stream
+      if (mediaStream) {
+        try {
+          mediaStream.getTracks().forEach(track => track.stop());
+        } catch (e) {
+          console.warn("Error stopping media stream:", e);
+        }
+      }
+
+      // Close WebSocket connection with a small delay to allow final messages
+      if (dataSocket) {
+        try {
+          // Small delay to allow any final messages to be sent
+          await new Promise(resolve => setTimeout(resolve, 100));
+          dataSocket.close();
+        } catch (e) {
+          console.warn("Error closing WebSocket:", e);
+        }
+      }
+
+      // Reset UI state
       startButton.disabled = false;
       stopButton.disabled = true;
       statusDiv.textContent = "Stopped recording.";
+      
+      // Clear audio processing resources
+      mediaProcessor = null;
+      audioContext = null;
+      mediaStream = null;
+      dataSocket = null;
     }
 
     // Send an audio chunk to the server

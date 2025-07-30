@@ -1183,19 +1183,49 @@ async def control_handler(websocket):
         reset_recorder_state()
 
 async def data_handler(websocket):
-    global writechunks, wav_file, server_metrics
+    global writechunks, wav_file, server_metrics, recorder_manager
     print(f"{bcolors.OKGREEN}Data client connected{bcolors.ENDC}")
     
     # Track connection metrics
     server_metrics.active_connections += 1
     server_metrics.total_connections += 1
     
+    # Clean up any stale connections first
+    stale_connections = set()
+    for conn in data_connections:
+        try:
+            await conn.ping()
+        except:
+            stale_connections.add(conn)
+    for conn in stale_connections:
+        data_connections.discard(conn)
+    
     data_connections.add(websocket)
     connection_refs.add(weakref.ref(websocket))
-    print(f"{bcolors.OKCYAN}[DEBUG] Total data connections: {len(data_connections)}{bcolors.ENDC}")
+    print(f"{bcolors.OKCYAN}[DEBUG] Total data connections after cleanup: {len(data_connections)}{bcolors.ENDC}")
     
-    # Reset recorder state for new connection
-    reset_recorder_state()
+    # Perform a full state reset for the new connection
+    try:
+        if recorder_manager:
+            # Stop any ongoing processing
+            await recorder_manager.recorder.clear_audio_queue()
+            recorder_manager.processing_state = "idle"
+            recorder_manager.text_repeat_count = 0
+            recorder_manager.last_processed_text = ""
+            
+            # Reset the recorder's internal state
+            await asyncio.to_thread(recorder_manager.recorder.reset_recorder_state)
+            
+            # Clear any pending messages in queues
+            while not recorder_manager.audio_queue.empty():
+                try:
+                    recorder_manager.audio_queue.get_nowait()
+                except queue.Empty:
+                    break
+            
+            print(f"{bcolors.OKGREEN}[DEBUG] Successfully reset recorder state for new connection{bcolors.ENDC}")
+    except Exception as e:
+        print(f"{bcolors.WARNING}[DEBUG] Error during connection state reset: {e}{bcolors.ENDC}")
     
     try:
         while True:
