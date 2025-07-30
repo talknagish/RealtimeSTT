@@ -182,6 +182,7 @@ allowed_methods = [
     'wakeup',
     'shutdown',
     'text',
+    'reset_recorder_state',
 ]
 allowed_parameters = [
     'language',
@@ -270,36 +271,12 @@ def text_detected(text, loop):
                 return True
             return False
 
-
         if ends_with_ellipsis(text):
             recorder.post_speech_silence_duration = global_args.mid_sentence_detection_pause
         elif sentence_end(text) and sentence_end(prev_text) and not ends_with_ellipsis(prev_text):
             recorder.post_speech_silence_duration = global_args.end_of_sentence_detection_pause
         else:
             recorder.post_speech_silence_duration = global_args.unknown_sentence_detection_pause
-
-
-        # # Append the new text with its timestamp
-        # current_time = time.time()
-        # text_time_deque.append((current_time, text))
-
-        # # Remove texts older than hard_break_even_on_background_noise seconds
-        # while text_time_deque and text_time_deque[0][0] < current_time - hard_break_even_on_background_noise:
-        #     text_time_deque.popleft()
-
-        # # Check if at least hard_break_even_on_background_noise_min_texts texts have arrived within the last hard_break_even_on_background_noise seconds
-        # if len(text_time_deque) >= hard_break_even_on_background_noise_min_texts:
-        #     texts = [t[1] for t in text_time_deque]
-        #     first_text = texts[0]
-        #     last_text = texts[-1]
-
-        #     # Compute the similarity ratio between the first and last texts
-        #     similarity = SequenceMatcher(None, first_text, last_text).ratio()
-
-        #     if similarity > hard_break_even_on_background_noise_min_similarity and len(first_text) > hard_break_even_on_background_noise_min_chars:
-        #         recorder.stop()
-        #         recorder.clear_audio_queue()
-        #         prev_text = ""
 
     prev_text = text
 
@@ -318,6 +295,21 @@ def text_detected(text, loop):
         print(f"  [{timestamp}] Realtime text: {bcolors.OKCYAN}{text}{bcolors.ENDC}\n", flush=True, end="")
     else:
         print(f"\r[{timestamp}] {bcolors.OKCYAN}{text}{bcolors.ENDC}", flush=True, end='')
+
+def reset_recorder_state():
+    """Reset recorder state to default values"""
+    global prev_text
+    if recorder:
+        # Reset silence duration to default
+        recorder.post_speech_silence_duration = global_args.unknown_sentence_detection_pause
+        # Clear any pending audio
+        recorder.clear_audio_queue()
+        # Reset recording state
+        if recorder.is_recording:
+            recorder.stop()
+    # Reset global variables
+    prev_text = ""
+    print(f"{bcolors.OKGREEN}[DEBUG] Recorder state reset{bcolors.ENDC}")
 
 def on_recording_start(loop):
     message = json.dumps({
@@ -582,6 +574,13 @@ def _recorder_thread(loop):
     for key, value in recorder_config.items():
         print(f"    {bcolors.OKBLUE}{key}{bcolors.ENDC}: {value}")
     recorder = AudioToTextRecorder(**recorder_config)
+    
+    # Add reset method to recorder object
+    def reset_recorder_state_method():
+        reset_recorder_state()
+    
+    recorder.reset_recorder_state = reset_recorder_state_method
+    
     print(f"{bcolors.OKGREEN}{bcolors.BOLD}RealtimeSTT initialized{bcolors.ENDC}")
     recorder_ready.set()
     
@@ -602,6 +601,10 @@ def _recorder_thread(loop):
             print(f"  [{timestamp}] Full text: {bcolors.BOLD}Sentence:{bcolors.ENDC} {bcolors.OKGREEN}{full_sentence}{bcolors.ENDC}\n", flush=True, end="")
         else:
             print(f"\r[{timestamp}] {bcolors.BOLD}Sentence:{bcolors.ENDC} {bcolors.OKGREEN}{full_sentence}{bcolors.ENDC}\n")
+        
+        # Reset recorder state after processing a full sentence
+        reset_recorder_state()
+        
     try:
         while not stop_recorder:
             recorder.text(process_text)
@@ -638,6 +641,10 @@ async def control_handler(websocket):
     print(f"{bcolors.OKGREEN}Control client connected{bcolors.ENDC}")
     global recorder
     control_connections.add(websocket)
+    
+    # Reset recorder state for new control connection
+    reset_recorder_state()
+    
     try:
         async for message in websocket:
             debug_print(f"Received control message: {message[:200]}...")
@@ -727,12 +734,18 @@ async def control_handler(websocket):
         print(f"{bcolors.WARNING}Control client disconnected: {e}{bcolors.ENDC}")
     finally:
         control_connections.remove(websocket)
+        # Reset recorder state when control connection closes
+        reset_recorder_state()
 
 async def data_handler(websocket):
     global writechunks, wav_file
     print(f"{bcolors.OKGREEN}Data client connected{bcolors.ENDC}")
     data_connections.add(websocket)
     print(f"{bcolors.OKCYAN}[DEBUG] Total data connections: {len(data_connections)}{bcolors.ENDC}")
+    
+    # Reset recorder state for new connection
+    reset_recorder_state()
+    
     try:
         while True:
             message = await websocket.recv()
@@ -780,7 +793,8 @@ async def data_handler(websocket):
     finally:
         data_connections.discard(websocket)
         print(f"{bcolors.OKCYAN}[DEBUG] Total data connections after disconnect: {len(data_connections)}{bcolors.ENDC}")
-        # recorder.clear_audio_queue()  # This was interfering with recorder state
+        # Reset recorder state when connection closes
+        reset_recorder_state()
 
 async def broadcast_audio_messages():
     while True:
