@@ -253,6 +253,9 @@ class HybridRecorderManager:
         self.result_queue = queue.Queue()
         self._last_activity_check = time.time()
         
+        # Thread-safe callback queue
+        self.callback_queue = queue.Queue()
+        
     async def initialize(self):
         """Initialize the recorder in a separate thread"""
         try:
@@ -281,6 +284,16 @@ class HybridRecorderManager:
             self.error_event.set()
             raise
     
+    def _create_thread_safe_callback(self, callback_func):
+        """Create a thread-safe callback that queues the call for async processing"""
+        def thread_safe_callback(*args, **kwargs):
+            try:
+                # Queue the callback for async processing
+                self.callback_queue.put((callback_func, args, kwargs))
+            except Exception as e:
+                print(f"{bcolors.FAIL}[ERROR] Error in thread-safe callback: {e}{bcolors.ENDC}")
+        return thread_safe_callback
+    
     def _recorder_thread_worker(self):
         """Worker thread for the recorder - runs the blocking recorder operations"""
         try:
@@ -301,8 +314,22 @@ class HybridRecorderManager:
                 # Put result in queue for async processing
                 self.result_queue.put(('full_sentence', full_sentence))
             
+            # Add watchdog timer to prevent getting stuck
+            last_processing_time = time.time()
+            watchdog_timeout = 30  # 30 seconds timeout
+            
             while not self.stop_recorder:
                 try:
+                    # Check if we've been processing too long without progress
+                    current_time = time.time()
+                    if current_time - last_processing_time > watchdog_timeout:
+                        print(f"{bcolors.WARNING}[DEBUG] Recorder watchdog timeout, clearing audio queue{bcolors.ENDC}")
+                        try:
+                            self.recorder.clear_audio_queue()
+                        except Exception as e:
+                            print(f"{bcolors.WARNING}[DEBUG] Error clearing audio queue: {e}{bcolors.ENDC}")
+                        last_processing_time = current_time
+                    
                     # Process text - this is the blocking operation
                     self.recorder.text(process_text)
                     recorder_health.record_success()
@@ -311,6 +338,9 @@ class HybridRecorderManager:
                     # Update activity time to prevent stuck detection
                     if hasattr(self, '_last_activity_check'):
                         self._last_activity_check = time.time()
+                    
+                    # Update processing time
+                    last_processing_time = time.time()
                     
                 except Exception as e:
                     print(f"{bcolors.FAIL}[ERROR] Recorder thread error: {e}{bcolors.ENDC}")
@@ -347,11 +377,36 @@ class HybridRecorderManager:
                     
                 # Process any results from the recorder thread
                 await self._process_recorder_results()
+                
+                # Process any callbacks from the recorder thread
+                await self._process_callbacks()
                     
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 print(f"{bcolors.WARNING}[DEBUG] Health monitor error: {e}{bcolors.ENDC}")
+    
+    async def _process_callbacks(self):
+        """Process callbacks from the recorder thread"""
+        try:
+            while not self.callback_queue.empty():
+                callback_func, args, kwargs = self.callback_queue.get_nowait()
+                
+                try:
+                    # Execute the callback in the async context
+                    if asyncio.iscoroutinefunction(callback_func):
+                        await callback_func(*args, **kwargs)
+                    else:
+                        # For non-async callbacks, run them in a thread
+                        await asyncio.to_thread(callback_func, *args, **kwargs)
+                        
+                except Exception as e:
+                    print(f"{bcolors.FAIL}[ERROR] Error executing callback: {e}{bcolors.ENDC}")
+                    
+        except queue.Empty:
+            pass
+        except Exception as e:
+            print(f"{bcolors.FAIL}[ERROR] Error processing callbacks: {e}{bcolors.ENDC}")
     
     async def _process_recorder_results(self):
         """Process results from the recorder thread"""
@@ -557,7 +612,8 @@ def format_timestamp_ns(timestamp_ns: int) -> str:
 
     return formatted_timestamp
 
-def text_detected(text, loop):
+async def text_detected_async(text, loop):
+    """Async version of text_detected for thread-safe processing"""
     global prev_text
 
     print(f"{bcolors.OKCYAN}[DEBUG] text_detected called with: '{text}'{bcolors.ENDC}")
@@ -600,7 +656,7 @@ def text_detected(text, loop):
         'text': text
     })
     print(f"{bcolors.OKGREEN}[DEBUG] Queuing realtime message: {message}{bcolors.ENDC}")
-    asyncio.run_coroutine_threadsafe(audio_queue.put(message), loop)
+    await audio_queue.put(message)
 
     # Get current timestamp in HH:MM:SS.nnn format
     timestamp = datetime.now().strftime('%H:%M:%S.%f')[:-3]
@@ -609,6 +665,15 @@ def text_detected(text, loop):
         print(f"  [{timestamp}] Realtime text: {bcolors.OKCYAN}{text}{bcolors.ENDC}\n", flush=True, end="")
     else:
         print(f"\r[{timestamp}] {bcolors.OKCYAN}{text}{bcolors.ENDC}", flush=True, end='')
+
+def text_detected(text, loop):
+    """Thread-safe wrapper for text_detected"""
+    if recorder_manager:
+        # Queue the async callback for processing
+        recorder_manager.callback_queue.put((text_detected_async, (text, loop), {}))
+    else:
+        # Fallback to direct call if recorder_manager is not available
+        asyncio.run_coroutine_threadsafe(text_detected_async(text, loop), loop)
 
 def reset_recorder_state():
     """Reset recorder state to default values"""
@@ -625,87 +690,160 @@ def reset_recorder_state():
     prev_text = ""
     print(f"{bcolors.OKGREEN}[DEBUG] Recorder state reset{bcolors.ENDC}")
 
-def on_recording_start(loop):
+async def on_recording_start_async(loop):
     message = json.dumps({
         'type': 'recording_start'
     })
-    asyncio.run_coroutine_threadsafe(audio_queue.put(message), loop)
+    await audio_queue.put(message)
 
-def on_recording_stop(loop):
+async def on_recording_stop_async(loop):
     message = json.dumps({
         'type': 'recording_stop'
     })
-    asyncio.run_coroutine_threadsafe(audio_queue.put(message), loop)
+    await audio_queue.put(message)
 
-def on_vad_detect_start(loop):
+async def on_vad_detect_start_async(loop):
     message = json.dumps({
         'type': 'vad_detect_start'
     })
-    asyncio.run_coroutine_threadsafe(audio_queue.put(message), loop)
+    await audio_queue.put(message)
 
-def on_vad_detect_stop(loop):
+async def on_vad_detect_stop_async(loop):
     message = json.dumps({
         'type': 'vad_detect_stop'
     })
-    asyncio.run_coroutine_threadsafe(audio_queue.put(message), loop)
+    await audio_queue.put(message)
 
-def on_wakeword_detected(loop):
+async def on_wakeword_detected_async(loop):
     message = json.dumps({
         'type': 'wakeword_detected'
     })
-    asyncio.run_coroutine_threadsafe(audio_queue.put(message), loop)
+    await audio_queue.put(message)
 
-def on_wakeword_detection_start(loop):
+async def on_wakeword_detection_start_async(loop):
     message = json.dumps({
         'type': 'wakeword_detection_start'
     })
-    asyncio.run_coroutine_threadsafe(audio_queue.put(message), loop)
+    await audio_queue.put(message)
 
-def on_wakeword_detection_end(loop):
+async def on_wakeword_detection_end_async(loop):
     message = json.dumps({
         'type': 'wakeword_detection_end'
     })
-    asyncio.run_coroutine_threadsafe(audio_queue.put(message), loop)
+    await audio_queue.put(message)
 
-def on_transcription_start(_audio_bytes, loop):
-    bytes_b64 = base64.b64encode(_audio_bytes.tobytes()).decode('utf-8')
+async def on_transcription_start_async(audio_bytes, loop):
+    bytes_b64 = base64.b64encode(audio_bytes.tobytes()).decode('utf-8')
     message = json.dumps({
         'type': 'transcription_start',
         'audio_bytes_base64': bytes_b64
     })
-    asyncio.run_coroutine_threadsafe(audio_queue.put(message), loop)
+    await audio_queue.put(message)
 
-def on_turn_detection_start(loop):
+async def on_turn_detection_start_async(loop):
     print("&&& stt_server on_turn_detection_start")
     message = json.dumps({
         'type': 'start_turn_detection'
     })
-    asyncio.run_coroutine_threadsafe(audio_queue.put(message), loop)
+    await audio_queue.put(message)
 
-def on_turn_detection_stop(loop):
+async def on_turn_detection_stop_async(loop):
     print("&&& stt_server on_turn_detection_stop")
     message = json.dumps({
         'type': 'stop_turn_detection'
     })
-    asyncio.run_coroutine_threadsafe(audio_queue.put(message), loop)
+    await audio_queue.put(message)
 
-def on_realtime_transcription_update(text, loop):
+async def on_realtime_transcription_update_async(text, loop):
     # Send real-time transcription updates to the client
     text = preprocess_text(text)
     message = json.dumps({
         'type': 'realtime_update',
         'text': text
     })
-    asyncio.run_coroutine_threadsafe(audio_queue.put(message), loop)
+    await audio_queue.put(message)
 
-def on_recorded_chunk(chunk, loop):
+async def on_recorded_chunk_async(chunk, loop):
     if send_recorded_chunk:
         bytes_b64 = base64.b64encode(chunk.tobytes()).decode('utf-8')
         message = json.dumps({
             'type': 'recorded_chunk',
             'bytes': bytes_b64
         })
-        asyncio.run_coroutine_threadsafe(audio_queue.put(message), loop)
+        await audio_queue.put(message)
+
+# Thread-safe wrapper functions
+def on_recording_start(loop):
+    if recorder_manager:
+        recorder_manager.callback_queue.put((on_recording_start_async, (loop,), {}))
+    else:
+        asyncio.run_coroutine_threadsafe(on_recording_start_async(loop), loop)
+
+def on_recording_stop(loop):
+    if recorder_manager:
+        recorder_manager.callback_queue.put((on_recording_stop_async, (loop,), {}))
+    else:
+        asyncio.run_coroutine_threadsafe(on_recording_stop_async(loop), loop)
+
+def on_vad_detect_start(loop):
+    if recorder_manager:
+        recorder_manager.callback_queue.put((on_vad_detect_start_async, (loop,), {}))
+    else:
+        asyncio.run_coroutine_threadsafe(on_vad_detect_start_async(loop), loop)
+
+def on_vad_detect_stop(loop):
+    if recorder_manager:
+        recorder_manager.callback_queue.put((on_vad_detect_stop_async, (loop,), {}))
+    else:
+        asyncio.run_coroutine_threadsafe(on_vad_detect_stop_async(loop), loop)
+
+def on_wakeword_detected(loop):
+    if recorder_manager:
+        recorder_manager.callback_queue.put((on_wakeword_detected_async, (loop,), {}))
+    else:
+        asyncio.run_coroutine_threadsafe(on_wakeword_detected_async(loop), loop)
+
+def on_wakeword_detection_start(loop):
+    if recorder_manager:
+        recorder_manager.callback_queue.put((on_wakeword_detection_start_async, (loop,), {}))
+    else:
+        asyncio.run_coroutine_threadsafe(on_wakeword_detection_start_async(loop), loop)
+
+def on_wakeword_detection_end(loop):
+    if recorder_manager:
+        recorder_manager.callback_queue.put((on_wakeword_detection_end_async, (loop,), {}))
+    else:
+        asyncio.run_coroutine_threadsafe(on_wakeword_detection_end_async(loop), loop)
+
+def on_transcription_start(audio_bytes, loop):
+    if recorder_manager:
+        recorder_manager.callback_queue.put((on_transcription_start_async, (audio_bytes, loop), {}))
+    else:
+        asyncio.run_coroutine_threadsafe(on_transcription_start_async(audio_bytes, loop), loop)
+
+def on_turn_detection_start(loop):
+    if recorder_manager:
+        recorder_manager.callback_queue.put((on_turn_detection_start_async, (loop,), {}))
+    else:
+        asyncio.run_coroutine_threadsafe(on_turn_detection_start_async(loop), loop)
+
+def on_turn_detection_stop(loop):
+    if recorder_manager:
+        recorder_manager.callback_queue.put((on_turn_detection_stop_async, (loop,), {}))
+    else:
+        asyncio.run_coroutine_threadsafe(on_turn_detection_stop_async(loop), loop)
+
+def on_realtime_transcription_update(text, loop):
+    if recorder_manager:
+        recorder_manager.callback_queue.put((on_realtime_transcription_update_async, (text, loop), {}))
+    else:
+        asyncio.run_coroutine_threadsafe(on_realtime_transcription_update_async(text, loop), loop)
+
+def on_recorded_chunk(chunk, loop):
+    if recorder_manager:
+        recorder_manager.callback_queue.put((on_recorded_chunk_async, (chunk, loop), {}))
+    else:
+        asyncio.run_coroutine_threadsafe(on_recorded_chunk_async(chunk, loop), loop)
 
 def decode_and_resample(
         audio_data,
