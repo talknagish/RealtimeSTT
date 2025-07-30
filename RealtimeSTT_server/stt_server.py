@@ -251,10 +251,8 @@ class HybridRecorderManager:
         # Thread-safe queues for communication
         self.audio_queue = queue.Queue()
         self.result_queue = queue.Queue()
-        self._last_activity_check = time.time()
-        
-        # Thread-safe callback queue
         self.callback_queue = queue.Queue()
+        self._last_activity_check = time.time()
         
         # State management to prevent stuck loops
         self.last_processed_text = ""
@@ -294,7 +292,6 @@ class HybridRecorderManager:
         """Create a thread-safe callback that queues the call for async processing"""
         def thread_safe_callback(*args, **kwargs):
             try:
-                # Queue the callback for async processing
                 self.callback_queue.put((callback_func, args, kwargs))
             except Exception as e:
                 print(f"{bcolors.FAIL}[ERROR] Error in thread-safe callback: {e}{bcolors.ENDC}")
@@ -305,51 +302,59 @@ class HybridRecorderManager:
         try:
             # Create thread-safe callback wrappers
             def thread_safe_text_detected(text):
-                # Queue the callback for async processing instead of calling directly
+                print(f"{bcolors.OKGREEN}[DEBUG] Thread-safe text_detected called with: '{text}'{bcolors.ENDC}")
                 self.callback_queue.put((text_detected_async, (text, self.loop), {}))
             
-            def thread_safe_on_recording_start():
-                self.callback_queue.put((on_recording_start_async, (self.loop,), {}))
-                
-            def thread_safe_on_recording_stop():
-                self.callback_queue.put((on_recording_stop_async, (self.loop,), {}))
-                
-            def thread_safe_on_vad_detect_start():
-                self.callback_queue.put((on_vad_detect_start_async, (self.loop,), {}))
-                
-            def thread_safe_on_vad_detect_stop():
-                self.callback_queue.put((on_vad_detect_stop_async, (self.loop,), {}))
-                
-            def thread_safe_on_turn_detection_start():
-                self.callback_queue.put((on_turn_detection_start_async, (self.loop,), {}))
-                
-            def thread_safe_on_turn_detection_stop():
-                self.callback_queue.put((on_turn_detection_stop_async, (self.loop,), {}))
+            # Create event handlers for each event type
+            def create_event_handler(event_type):
+                return lambda *args: self.callback_queue.put((_handle_event_async, (event_type, *args, self.loop), {}))
             
-            # Create recorder in this thread first
+            callbacks = {
+                event: create_event_handler(event.replace('on_', '').replace('_', ' '))
+                for event in [
+                    'on_recording_start', 'on_recording_stop',
+                    'on_vad_detect_start', 'on_vad_detect_stop',
+                    'on_turn_detection_start', 'on_turn_detection_stop'
+                ]
+            }
+            
+            # Special handlers for text-based events
+            callbacks.update({
+                'on_realtime_transcription_update': thread_safe_text_detected,
+                'on_realtime_transcription_stabilized': thread_safe_text_detected
+            })
+            
+            # Create recorder and override callbacks
             self.recorder = AudioToTextRecorder(**self.config)
-            
-            # Override the callback methods with thread-safe versions
-            self.recorder.on_recording_start = thread_safe_on_recording_start
-            self.recorder.on_recording_stop = thread_safe_on_recording_stop
-            self.recorder.on_vad_detect_start = thread_safe_on_vad_detect_start
-            self.recorder.on_vad_detect_stop = thread_safe_on_vad_detect_stop
-            self.recorder.on_turn_detection_start = thread_safe_on_turn_detection_start
-            self.recorder.on_turn_detection_stop = thread_safe_on_turn_detection_stop
-            self.recorder.on_realtime_transcription_update = thread_safe_text_detected
+            for callback_name, callback_func in callbacks.items():
+                setattr(self.recorder, callback_name, callback_func)
             
             # Add reset method to recorder object
-            def reset_recorder_state_method():
-                self._reset_recorder_state()
+            self.recorder.reset_recorder_state = self._reset_recorder_state
             
-            self.recorder.reset_recorder_state = reset_recorder_state_method
+            # Force override any internal callback references
+            if hasattr(self.recorder, '_callbacks'):
+                self.recorder._callbacks.update({
+                    'on_realtime_transcription_update': callbacks['on_realtime_transcription_update'],
+                    'on_realtime_transcription_stabilized': callbacks['on_realtime_transcription_stabilized']
+                })
+            
+            # Monkey patch the recorder's callback calling mechanism
+            if original_run_callback := getattr(self.recorder, '_run_callback', None):
+                def thread_safe_run_callback(callback, *args, **kwargs):
+                    if callback == getattr(self.recorder, 'on_realtime_transcription_update', None):
+                        callbacks['on_realtime_transcription_update'](*args, **kwargs)
+                    else:
+                        original_run_callback(callback, *args, **kwargs)
+                setattr(self.recorder, '_run_callback', thread_safe_run_callback)
+            
+            print(f"{bcolors.OKGREEN}[DEBUG] Recorder callbacks overridden with thread-safe versions{bcolors.ENDC}")
             
             # Signal that recorder is ready
             self.recorder_ready.set()
             
             # Main processing loop with thread-safe text processing
             def process_text(full_sentence):
-                # Put result in queue for async processing
                 self.result_queue.put(('full_sentence', full_sentence))
             
             # Add watchdog timer to prevent getting stuck
@@ -385,7 +390,6 @@ class HybridRecorderManager:
                     print(f"{bcolors.FAIL}[ERROR] Recorder thread error: {e}{bcolors.ENDC}")
                     server_metrics.recorder_errors += 1
                     recorder_health.record_error()
-                    # Don't sleep, just continue processing
                     
         except Exception as e:
             print(f"{bcolors.FAIL}[ERROR] Failed to create recorder: {e}{bcolors.ENDC}")
@@ -437,6 +441,7 @@ class HybridRecorderManager:
                 callback_func, args, kwargs = self.callback_queue.get_nowait()
                 
                 try:
+                    print(f"{bcolors.OKBLUE}[DEBUG] Processing callback: {callback_func.__name__}{bcolors.ENDC}")
                     # Execute the callback in the async context
                     if asyncio.iscoroutinefunction(callback_func):
                         await callback_func(*args, **kwargs)
@@ -651,28 +656,39 @@ def preprocess_text(text):
     
     return text
 
-def debug_print(message):
-    if debug_logging:
-        timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-        thread_name = threading.current_thread().name
-        print(f"{Fore.CYAN}[DEBUG][{timestamp}][{thread_name}] {message}{Style.RESET_ALL}", file=sys.stderr)
+# Consolidated logging and formatting utilities
+class LogUtil:
+    @staticmethod
+    def debug(message, color=bcolors.OKCYAN):
+        if debug_logging:
+            timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+            thread_name = threading.current_thread().name
+            print(f"{color}[DEBUG][{timestamp}][{thread_name}] {message}{bcolors.ENDC}", file=sys.stderr)
+    
+    @staticmethod
+    def error(message, e=None):
+        error_msg = f"{message}: {e}" if e else message
+        print(f"{bcolors.FAIL}[ERROR] {error_msg}{bcolors.ENDC}")
+    
+    @staticmethod
+    def warning(message):
+        print(f"{bcolors.WARNING}[WARNING] {message}{bcolors.ENDC}")
+    
+    @staticmethod
+    def success(message):
+        print(f"{bcolors.OKGREEN}[SUCCESS] {message}{bcolors.ENDC}")
+    
+    @staticmethod
+    def format_timestamp(timestamp_ns: int) -> str:
+        dt = datetime.fromtimestamp(timestamp_ns // 1_000_000_000)
+        ms = (timestamp_ns % 1_000_000_000) // 1_000_000
+        return f"{dt.strftime('%H:%M:%S')}.{ms:03d}"
 
-def format_timestamp_ns(timestamp_ns: int) -> str:
-    # Split into whole seconds and the nanosecond remainder
-    seconds = timestamp_ns // 1_000_000_000
-    remainder_ns = timestamp_ns % 1_000_000_000
-
-    # Convert seconds part into a datetime object (local time)
-    dt = datetime.fromtimestamp(seconds)
-
-    # Format the main time as HH:MM:SS
-    time_str = dt.strftime("%H:%M:%S")
-
-    # For instance, if you want milliseconds, divide the remainder by 1e6 and format as 3-digit
-    milliseconds = remainder_ns // 1_000_000
-    formatted_timestamp = f"{time_str}.{milliseconds:03d}"
-
-    return formatted_timestamp
+# Consolidated callback functions to reduce duplication
+async def _send_message_async(message_type: str, **kwargs):
+    """Generic async function to send messages to clients"""
+    message = json.dumps({'type': message_type, **kwargs})
+    await audio_queue.put(message)
 
 async def text_detected_async(text, loop):
     """Async version of text_detected for thread-safe processing"""
@@ -705,17 +721,11 @@ async def text_detected_async(text, loop):
 
     if silence_timing:
         def ends_with_ellipsis(text: str):
-            if text.endswith("..."):
-                return True
-            if len(text) > 1 and text[:-1].endswith("..."):
-                return True
-            return False
+            return text.endswith("...") or (len(text) > 1 and text[:-1].endswith("..."))
 
         def sentence_end(text: str):
             sentence_end_marks = ['.', '!', '?', '。']
-            if text and text[-1] in sentence_end_marks:
-                return True
-            return False
+            return text and text[-1] in sentence_end_marks
 
         if recorder_manager and recorder_manager.recorder:
             try:
@@ -730,13 +740,9 @@ async def text_detected_async(text, loop):
 
     prev_text = text
 
-    # Put the message in the audio queue to be sent to clients
-    message = json.dumps({
-        'type': 'realtime',
-        'text': text
-    })
-    print(f"{bcolors.OKGREEN}[DEBUG] Queuing realtime message: {message}{bcolors.ENDC}")
-    await audio_queue.put(message)
+    # Send realtime message
+    await _send_message_async('realtime', text=text)
+    print(f"{bcolors.OKGREEN}[DEBUG] Queuing realtime message: {json.dumps({'type': 'realtime', 'text': text})}{bcolors.ENDC}")
 
     # Get current timestamp in HH:MM:SS.nnn format
     timestamp = datetime.now().strftime('%H:%M:%S.%f')[:-3]
@@ -758,172 +764,59 @@ def text_detected(text, loop):
 def reset_recorder_state():
     """Reset recorder state to default values"""
     global prev_text
+    prev_text = ""
     if recorder_manager and recorder_manager.recorder:
         try:
-            # Reset silence duration to default
             recorder_manager.recorder.post_speech_silence_duration = global_args.unknown_sentence_detection_pause
-            # Don't clear audio queue or stop recording as it might interfere with ongoing processing
-            # Only reset global variables
+            print(f"{bcolors.OKGREEN}[DEBUG] Recorder state reset{bcolors.ENDC}")
         except Exception as e:
-            print(f"{bcolors.WARNING}[DEBUG] Error in reset_recorder_state: {e}{bcolors.ENDC}")
-    # Reset global variables
-    prev_text = ""
-    print(f"{bcolors.OKGREEN}[DEBUG] Recorder state reset{bcolors.ENDC}")
+            print(f"{bcolors.WARNING}[DEBUG] Error resetting recorder state: {e}{bcolors.ENDC}")
 
-async def on_recording_start_async(loop):
-    message = json.dumps({
-        'type': 'recording_start'
-    })
-    await audio_queue.put(message)
-
-async def on_recording_stop_async(loop):
-    message = json.dumps({
-        'type': 'recording_stop'
-    })
-    await audio_queue.put(message)
-
-async def on_vad_detect_start_async(loop):
-    message = json.dumps({
-        'type': 'vad_detect_start'
-    })
-    await audio_queue.put(message)
-
-async def on_vad_detect_stop_async(loop):
-    message = json.dumps({
-        'type': 'vad_detect_stop'
-    })
-    await audio_queue.put(message)
-
-async def on_wakeword_detected_async(loop):
-    message = json.dumps({
-        'type': 'wakeword_detected'
-    })
-    await audio_queue.put(message)
-
-async def on_wakeword_detection_start_async(loop):
-    message = json.dumps({
-        'type': 'wakeword_detection_start'
-    })
-    await audio_queue.put(message)
-
-async def on_wakeword_detection_end_async(loop):
-    message = json.dumps({
-        'type': 'wakeword_detection_end'
-    })
-    await audio_queue.put(message)
-
-async def on_transcription_start_async(audio_bytes, loop):
-    bytes_b64 = base64.b64encode(audio_bytes.tobytes()).decode('utf-8')
-    message = json.dumps({
-        'type': 'transcription_start',
-        'audio_bytes_base64': bytes_b64
-    })
-    await audio_queue.put(message)
-
-async def on_turn_detection_start_async(loop):
-    print("&&& stt_server on_turn_detection_start")
-    message = json.dumps({
-        'type': 'start_turn_detection'
-    })
-    await audio_queue.put(message)
-
-async def on_turn_detection_stop_async(loop):
-    print("&&& stt_server on_turn_detection_stop")
-    message = json.dumps({
-        'type': 'stop_turn_detection'
-    })
-    await audio_queue.put(message)
-
-async def on_realtime_transcription_update_async(text, loop):
-    # Send real-time transcription updates to the client
-    text = preprocess_text(text)
-    message = json.dumps({
-        'type': 'realtime_update',
-        'text': text
-    })
-    await audio_queue.put(message)
-
-async def on_recorded_chunk_async(chunk, loop):
-    if send_recorded_chunk:
-        bytes_b64 = base64.b64encode(chunk.tobytes()).decode('utf-8')
-        message = json.dumps({
-            'type': 'recorded_chunk',
-            'bytes': bytes_b64
-        })
-        await audio_queue.put(message)
-
-# Thread-safe wrapper functions
-def on_recording_start(loop):
-    if recorder_manager:
-        recorder_manager.callback_queue.put((on_recording_start_async, (loop,), {}))
+# Consolidated async callback functions
+# Consolidated async event handlers
+async def _handle_event_async(event_type, data=None, loop=None):
+    """Generic event handler for all async events"""
+    if event_type == 'transcription_start' and data:
+        bytes_b64 = base64.b64encode(data.tobytes()).decode('utf-8')
+        await _send_message_async(event_type, audio_bytes_base64=bytes_b64)
+    elif event_type == 'recorded_chunk' and data and send_recorded_chunk:
+        bytes_b64 = base64.b64encode(data.tobytes()).decode('utf-8')
+        await _send_message_async(event_type, bytes=bytes_b64)
+    elif event_type == 'realtime_update' and data:
+        await _send_message_async(event_type, text=preprocess_text(data))
+    elif event_type in ['turn_detection_start', 'turn_detection_stop']:
+        print(f"&&& stt_server {event_type}")
+        await _send_message_async(event_type.replace('_', ' '))
     else:
-        asyncio.run_coroutine_threadsafe(on_recording_start_async(loop), loop)
+        await _send_message_async(event_type)
 
-def on_recording_stop(loop):
-    if recorder_manager:
-        recorder_manager.callback_queue.put((on_recording_stop_async, (loop,), {}))
-    else:
-        asyncio.run_coroutine_threadsafe(on_recording_stop_async(loop), loop)
+# Thread-safe wrapper functions using a factory pattern
+def _create_thread_safe_wrapper(async_func):
+    """Factory function to create thread-safe wrapper functions"""
+    def wrapper(*args, **kwargs):
+        if recorder_manager:
+            recorder_manager.callback_queue.put((async_func, args, kwargs))
+        else:
+            asyncio.run_coroutine_threadsafe(async_func(*args, **kwargs), loop)
+    return wrapper
 
-def on_vad_detect_start(loop):
-    if recorder_manager:
-        recorder_manager.callback_queue.put((on_vad_detect_start_async, (loop,), {}))
-    else:
-        asyncio.run_coroutine_threadsafe(on_vad_detect_start_async(loop), loop)
+# Create event handlers dynamically
+EVENT_TYPES = [
+    'recording_start', 'recording_stop',
+    'vad_detect_start', 'vad_detect_stop',
+    'wakeword_detected', 'wakeword_detection_start', 'wakeword_detection_end',
+    'transcription_start', 'turn_detection_start', 'turn_detection_stop',
+    'realtime_transcription_update', 'recorded_chunk'
+]
 
-def on_vad_detect_stop(loop):
-    if recorder_manager:
-        recorder_manager.callback_queue.put((on_vad_detect_stop_async, (loop,), {}))
-    else:
-        asyncio.run_coroutine_threadsafe(on_vad_detect_stop_async(loop), loop)
+def create_event_handler(event_type):
+    async def handler(*args, **kwargs):
+        await _handle_event_async(event_type, *args, asyncio.get_event_loop())
+    return _create_thread_safe_wrapper(handler)
 
-def on_wakeword_detected(loop):
-    if recorder_manager:
-        recorder_manager.callback_queue.put((on_wakeword_detected_async, (loop,), {}))
-    else:
-        asyncio.run_coroutine_threadsafe(on_wakeword_detected_async(loop), loop)
-
-def on_wakeword_detection_start(loop):
-    if recorder_manager:
-        recorder_manager.callback_queue.put((on_wakeword_detection_start_async, (loop,), {}))
-    else:
-        asyncio.run_coroutine_threadsafe(on_wakeword_detection_start_async(loop), loop)
-
-def on_wakeword_detection_end(loop):
-    if recorder_manager:
-        recorder_manager.callback_queue.put((on_wakeword_detection_end_async, (loop,), {}))
-    else:
-        asyncio.run_coroutine_threadsafe(on_wakeword_detection_end_async(loop), loop)
-
-def on_transcription_start(audio_bytes, loop):
-    if recorder_manager:
-        recorder_manager.callback_queue.put((on_transcription_start_async, (audio_bytes, loop), {}))
-    else:
-        asyncio.run_coroutine_threadsafe(on_transcription_start_async(audio_bytes, loop), loop)
-
-def on_turn_detection_start(loop):
-    if recorder_manager:
-        recorder_manager.callback_queue.put((on_turn_detection_start_async, (loop,), {}))
-    else:
-        asyncio.run_coroutine_threadsafe(on_turn_detection_start_async(loop), loop)
-
-def on_turn_detection_stop(loop):
-    if recorder_manager:
-        recorder_manager.callback_queue.put((on_turn_detection_stop_async, (loop,), {}))
-    else:
-        asyncio.run_coroutine_threadsafe(on_turn_detection_stop_async(loop), loop)
-
-def on_realtime_transcription_update(text, loop):
-    if recorder_manager:
-        recorder_manager.callback_queue.put((on_realtime_transcription_update_async, (text, loop), {}))
-    else:
-        asyncio.run_coroutine_threadsafe(on_realtime_transcription_update_async(text, loop), loop)
-
-def on_recorded_chunk(chunk, loop):
-    if recorder_manager:
-        recorder_manager.callback_queue.put((on_recorded_chunk_async, (chunk, loop), {}))
-    else:
-        asyncio.run_coroutine_threadsafe(on_recorded_chunk_async(chunk, loop), loop)
+# Create all event handlers dynamically
+for event_type in EVENT_TYPES:
+    globals()[f'on_{event_type}'] = create_event_handler(event_type)
 
 def decode_and_resample(
         audio_data,
@@ -1008,7 +901,7 @@ def parse_arguments():
                         help='Minimum duration of valid recordings in seconds. This prevents very short recordings from being processed, which could be caused by noise or accidental sounds. Default is 1.1 seconds.')
 
     parser.add_argument('--min_gap_between_recordings', type=float, default=0,
-                        help='Minimum time (in seconds) between consecutive recordings. Setting this helps avoid overlapping recordings when there’s a brief silence between them. Default is 0 seconds.')
+                        help='Minimum time (in seconds) between consecutive recordings. Setting this helps avoid overlapping recordings when theres a brief silence between them. Default is 0 seconds.')
 
     parser.add_argument('--enable_realtime_transcription', action='store_true', default=True,
                         help='Enable continuous real-time transcription of audio as it is received. When enabled, transcriptions are sent in near real-time. Default is True.')
@@ -1121,7 +1014,7 @@ def parse_arguments():
     return args
 
 async def control_handler(websocket):
-    debug_print(f"New control connection from {websocket.remote_address}")
+    LogUtil.debug(f"New control connection from {websocket.remote_address}")
     print(f"{bcolors.OKGREEN}Control client connected{bcolors.ENDC}")
     global recorder_manager, server_metrics
     
@@ -1137,9 +1030,9 @@ async def control_handler(websocket):
     
     try:
         async for message in websocket:
-            debug_print(f"Received control message: {message[:200]}...")
+            LogUtil.debug(f"Received control message: {message[:200]}...")
             if not recorder_manager.ready_event.is_set():
-                print(f"{bcolors.WARNING}Recorder not ready{bcolors.ENDC}")
+                LogUtil.warning("Recorder not ready")
                 continue
             if isinstance(message, str):
                 # Handle text message (command)
@@ -1263,46 +1156,44 @@ async def data_handler(websocket):
         while True:
             message = await websocket.recv()
             if isinstance(message, bytes):
-                if extended_logging:
-                    debug_print(f"Received audio chunk (size: {len(message)} bytes)")
-                elif log_incoming_chunks:
-                    print(".", end='', flush=True)
-                # Handle binary message (audio data)
-                metadata_length = int.from_bytes(message[:4], byteorder='little')
-                metadata_json = message[4:4+metadata_length].decode('utf-8')
-                metadata = json.loads(metadata_json)
-                sample_rate = metadata['sampleRate']
+                                    # Handle binary message (audio data)
+                    metadata_length = int.from_bytes(message[:4], byteorder='little')
+                    metadata_json = message[4:4+metadata_length].decode('utf-8')
+                    metadata = json.loads(metadata_json)
+                    sample_rate = metadata['sampleRate']
+                    chunk = message[4+metadata_length:]
 
-                if 'server_sent_to_stt' in metadata:
-                    stt_received_ns = time.time_ns()
-                    metadata["stt_received"] = stt_received_ns
-                    metadata["stt_received_formatted"] = format_timestamp_ns(stt_received_ns)
-                    print(f"Server received audio chunk of length {len(message)} bytes, metadata: {metadata}")
-
-                if extended_logging:
-                    debug_print(f"Processing audio chunk with sample rate {sample_rate}")
-                chunk = message[4+metadata_length:]
-
-                if writechunks:
-                    if not wav_file:
-                        wav_file = wave.open(writechunks, 'wb')
-                        wav_file.setnchannels(CHANNELS)
-                        wav_file.setsampwidth(pyaudio.get_sample_size(FORMAT))
-                        wav_file.setframerate(sample_rate)
-
-                    wav_file.writeframes(chunk)
-
-                if sample_rate != 16000:
-                    resampled_chunk = decode_and_resample(chunk, sample_rate, 16000)
                     if extended_logging:
-                        debug_print(f"Resampled chunk size: {len(resampled_chunk)} bytes")
-                    await recorder_manager.process_audio(resampled_chunk)
-                else:
-                    await recorder_manager.process_audio(chunk)
+                        LogUtil.debug(f"Received audio chunk (size: {len(message)} bytes)")
+                        LogUtil.debug(f"Processing audio chunk with sample rate {sample_rate}")
+                    elif log_incoming_chunks:
+                        print(".", end='', flush=True)
+
+                    if 'server_sent_to_stt' in metadata:
+                        stt_received_ns = time.time_ns()
+                        metadata["stt_received"] = stt_received_ns
+                        metadata["stt_received_formatted"] = LogUtil.format_timestamp(stt_received_ns)
+                        LogUtil.debug(f"Server received audio chunk of length {len(message)} bytes, metadata: {metadata}")
+
+                    if writechunks:
+                        if not wav_file:
+                            wav_file = wave.open(writechunks, 'wb')
+                            wav_file.setnchannels(CHANNELS)
+                            wav_file.setsampwidth(pyaudio.get_sample_size(FORMAT))
+                            wav_file.setframerate(sample_rate)
+                        wav_file.writeframes(chunk)
+
+                    if sample_rate != 16000:
+                        resampled_chunk = decode_and_resample(chunk, sample_rate, 16000)
+                        if extended_logging:
+                            LogUtil.debug(f"Resampled chunk size: {len(resampled_chunk)} bytes")
+                        await recorder_manager.process_audio(resampled_chunk)
+                    else:
+                        await recorder_manager.process_audio(chunk)
                 
-                # Update heartbeat timer when audio is fed to recorder
-                if 'last_activity_time' in globals():
-                    globals()['last_activity_time'] = time.time()
+                    # Update heartbeat timer when audio is fed to recorder
+                    if 'last_activity_time' in globals():
+                        globals()['last_activity_time'] = time.time()
             else:
                 print(f"{bcolors.WARNING}Received non-binary message on data connection{bcolors.ENDC}")
     except websockets.exceptions.ConnectionClosed as e:
@@ -1450,178 +1341,146 @@ def make_callback(loop, callback):
         callback(*args, **kwargs, loop=loop)
     return inner_callback
 
-async def main_async():            
-    global recorder_manager, global_args
+class STTServer:
+    def __init__(self, args):
+        self.args = args
+        self.loop = asyncio.get_event_loop()
+        self.tasks = []
+        self.servers = {}
+        
+    async def start(self):
+        """Start all server components"""
+        try:
+            # Initialize recorder manager
+            recorder_config = self._create_recorder_config()
+            global recorder_manager
+            recorder_manager = HybridRecorderManager(recorder_config, self.loop)
+            await recorder_manager.initialize()
+            
+            # Start servers
+            await self._start_websocket_servers()
+            await self._start_health_check_server()
+            
+            # Start background tasks
+            self.tasks.extend([
+                asyncio.create_task(broadcast_audio_messages()),
+                asyncio.create_task(production_monitoring())
+            ])
+            
+            LogUtil.success("Production server started. Press Ctrl+C to stop.")
+            LogUtil.success(f"Monitoring: http://0.0.0.0:8080/health")
+            LogUtil.success(f"Metrics: http://0.0.0.0:8080/metrics")
+            
+            # Wait for broadcast task
+            await self.tasks[0]
+            
+        except OSError as e:
+            LogUtil.error("Could not start server - ports may be in use")
+            raise
+        except KeyboardInterrupt:
+            LogUtil.warning("Server interrupted by user")
+        except Exception as e:
+            LogUtil.error("Server error", e)
+            raise
+        finally:
+            await self.shutdown()
+    
+    def _create_recorder_config(self):
+        """Create recorder configuration from arguments"""
+        config = {
+            k: getattr(self.args, k.replace('-', '_'))
+            for k in [
+                'model', 'download_root', 'realtime_model_type', 'language', 'batch_size',
+                'init_realtime_after_seconds', 'realtime_batch_size', 'initial_prompt_realtime',
+                'input_device_index', 'silero_sensitivity', 'silero_use_onnx', 'webrtc_sensitivity',
+                'post_speech_silence_duration', 'min_length_of_recording', 'min_gap_between_recordings',
+                'enable_realtime_transcription', 'realtime_processing_pause', 'silero_deactivity_detection',
+                'early_transcription_on_silence', 'beam_size', 'beam_size_realtime', 'initial_prompt',
+                'wake_words', 'wake_words_sensitivity', 'wake_word_timeout', 'wake_word_activation_delay',
+                'wakeword_backend', 'openwakeword_model_paths', 'openwakeword_inference_framework',
+                'wake_word_buffer_duration', 'use_main_model_for_realtime', 'use_extended_logging',
+                'compute_type', 'gpu_device_index', 'device', 'handle_buffer_overflow', 'suppress_tokens',
+                'allowed_latency_limit', 'faster_whisper_vad_filter'
+            ] if hasattr(self.args, k.replace('-', '_'))
+        }
+        return {**config, 'spinner': False, 'use_microphone': False, 'no_log_file': True, 'level': loglevel}
+    
+    async def _start_websocket_servers(self):
+        """Start WebSocket servers for control and data"""
+        try:
+            self.servers['control'] = await serve(control_handler, "0.0.0.0", self.args.control)
+            self.servers['data'] = await serve(data_handler, "0.0.0.0", self.args.data)
+            LogUtil.success(f"Control server started on ws://0.0.0.0:{self.args.control}")
+            LogUtil.success(f"Data server started on ws://0.0.0.0:{self.args.data}")
+        except Exception as e:
+            LogUtil.error("Failed to start WebSocket servers", e)
+            raise
+    
+    async def _start_health_check_server(self):
+        """Start HTTP health check server"""
+        try:
+            self.servers['health'] = await start_health_check_server(port=8080)
+        except Exception as e:
+            LogUtil.error("Failed to start health check server", e)
+            raise
+    
+    async def shutdown(self):
+        """Graceful shutdown of all components"""
+        await shutdown_procedure()
+        LogUtil.success("Server shutdown complete")
+
+async def main_async():
+    global global_args
     args = parse_arguments()
     global_args = args
-
-    # Get the event loop here and pass it to the recorder thread
-    loop = asyncio.get_event_loop()
-
-    recorder_manager = HybridRecorderManager(
-        {
-            'model': args.model,
-            'download_root': args.root,
-            'realtime_model_type': args.rt_model,
-            'language': args.lang,
-            'batch_size': args.batch,
-            'init_realtime_after_seconds': args.init_realtime_after_seconds,
-            'realtime_batch_size': args.realtime_batch_size,
-            'initial_prompt_realtime': args.initial_prompt_realtime,
-            'input_device_index': args.input_device,
-            'silero_sensitivity': args.silero_sensitivity,
-            'silero_use_onnx': args.silero_use_onnx,
-            'webrtc_sensitivity': args.webrtc_sensitivity,
-            'post_speech_silence_duration': args.unknown_sentence_detection_pause,
-            'min_length_of_recording': args.min_length_of_recording,
-            'min_gap_between_recordings': args.min_gap_between_recordings,
-            'enable_realtime_transcription': args.enable_realtime_transcription,
-            'realtime_processing_pause': args.realtime_processing_pause,
-            'silero_deactivity_detection': args.silero_deactivity_detection,
-            'early_transcription_on_silence': args.early_transcription_on_silence,
-            'beam_size': args.beam_size,
-            'beam_size_realtime': args.beam_size_realtime,
-            'initial_prompt': args.initial_prompt,
-            'wake_words': args.wake_words,
-            'wake_words_sensitivity': args.wake_words_sensitivity,
-            'wake_word_timeout': args.wake_word_timeout,
-            'wake_word_activation_delay': args.wake_word_activation_delay,
-            'wakeword_backend': args.wakeword_backend,
-            'openwakeword_model_paths': args.openwakeword_model_paths,
-            'openwakeword_inference_framework': args.openwakeword_inference_framework,
-            'wake_word_buffer_duration': args.wake_word_buffer_duration,
-            'use_main_model_for_realtime': args.use_main_model_for_realtime,
-            'spinner': False,
-            'use_microphone': False,
-
-            'on_realtime_transcription_update': make_callback(loop, text_detected),
-            'on_recording_start': make_callback(loop, on_recording_start),
-            'on_recording_stop': make_callback(loop, on_recording_stop),
-            'on_vad_detect_start': make_callback(loop, on_vad_detect_start),
-            'on_vad_detect_stop': make_callback(loop, on_vad_detect_stop),
-            'on_wakeword_detected': make_callback(loop, on_wakeword_detected),
-            'on_wakeword_detection_start': make_callback(loop, on_wakeword_detection_start),
-            'on_wakeword_detection_end': make_callback(loop, on_wakeword_detection_end),
-            'on_transcription_start': make_callback(loop, on_transcription_start),
-            'on_turn_detection_start': make_callback(loop, on_turn_detection_start),
-            'on_turn_detection_stop': make_callback(loop, on_turn_detection_stop),
-
-            'on_recorded_chunk': make_callback(loop, on_recorded_chunk),
-            'no_log_file': True,  # Disable logging to file
-            'use_extended_logging': args.use_extended_logging,
-            'level': loglevel,
-            'compute_type': args.compute_type,
-            'gpu_device_index': args.gpu_device_index,
-            'device': args.device,
-            'handle_buffer_overflow': args.handle_buffer_overflow,
-            'suppress_tokens': args.suppress_tokens,
-            'allowed_latency_limit': args.allowed_latency_limit,
-            'faster_whisper_vad_filter': args.faster_whisper_vad_filter,
-        },
-        loop
-    )
-
-    try:
-        # Attempt to start control and data servers with proper error handling
-        try:
-            control_server = await serve(
-                control_handler, 
-                "0.0.0.0", 
-                args.control
-            )
-            data_server = await serve(
-                data_handler, 
-                "0.0.0.0", 
-                args.data
-            )
-            print(f"{bcolors.OKGREEN}Control server started on {bcolors.OKBLUE}ws://0.0.0.0:{args.control}{bcolors.ENDC}")
-            print(f"{bcolors.OKGREEN}Data server started on {bcolors.OKBLUE}ws://0.0.0.0:{args.data}{bcolors.ENDC}")
-        except Exception as e:
-            print(f"{bcolors.FAIL}Error starting WebSocket servers: {e}{bcolors.ENDC}")
-            raise
-
-        # Start HTTP health check server
-        try:
-            health_check_runner = await start_health_check_server(port=8080)
-        except Exception as e:
-            print(f"{bcolors.FAIL}Error starting health check server: {e}{bcolors.ENDC}")
-            raise
-
-        # Start the broadcast and recorder threads
-        broadcast_task = asyncio.create_task(broadcast_audio_messages())
-
-        # Initialize recorder and start processing
-        await recorder_manager.initialize()
-        # The recorder_manager.start_processing() call is now handled by the recorder_thread
-        
-        # Start production monitoring task
-        monitoring_task = asyncio.create_task(production_monitoring())
-
-        print(f"{bcolors.OKGREEN}Production server started. Press Ctrl+C to stop the server.{bcolors.ENDC}")
-        print(f"{bcolors.OKGREEN}Monitoring: {bcolors.OKBLUE}http://0.0.0.0:8080/health{bcolors.ENDC}")
-        print(f"{bcolors.OKGREEN}Metrics: {bcolors.OKBLUE}http://0.0.0.0:8080/metrics{bcolors.ENDC}")
-
-        # Run server tasks - wait for broadcast task to complete or server shutdown
-        try:
-            await broadcast_task
-        except asyncio.CancelledError:
-            pass
-    except OSError as e:
-        print(f"{bcolors.FAIL}Error: Could not start server on specified ports. It’s possible another instance of the server is already running, or the ports are being used by another application.{bcolors.ENDC}")
-    except KeyboardInterrupt:
-        print(f"{bcolors.WARNING}Server interrupted by user, shutting down...{bcolors.ENDC}")
-    finally:
-        # Shutdown procedures for recorder and server threads
-        await shutdown_procedure()
-        print(f"{bcolors.OKGREEN}Server shutdown complete.{bcolors.ENDC}")
+    server = STTServer(args)
+    await server.start()
 
 async def shutdown_procedure():
-    global recorder_manager, health_check_runner
+    """Graceful shutdown of all server components"""
+    global recorder_manager
     
-    print(f"{bcolors.OKGREEN}Starting graceful shutdown...{bcolors.ENDC}")
+    LogUtil.success("Starting graceful shutdown...")
     
-    # Close WebSocket servers first
-    if 'control_server' in globals() and control_server:
-        control_server.close()
-        await control_server.wait_closed()
-        print(f"{bcolors.OKGREEN}Control server closed{bcolors.ENDC}")
+    # Close all servers
+    for server_type, server in STTServer.servers.items():
+        try:
+            if server_type == 'health':
+                await server.cleanup()
+            else:
+                server.close()
+                await server.wait_closed()
+            LogUtil.success(f"{server_type.title()} server closed")
+        except Exception as e:
+            LogUtil.error(f"Error closing {server_type} server", e)
     
-    if 'data_server' in globals() and data_server:
-        data_server.close()
-        await data_server.wait_closed()
-        print(f"{bcolors.OKGREEN}Data server closed{bcolors.ENDC}")
-    
-    # Close health check server if it exists
-    if 'health_check_runner' in globals() and health_check_runner:
-        await health_check_runner.cleanup()
-        print(f"{bcolors.OKGREEN}Health check server closed{bcolors.ENDC}")
-    
-    # Shutdown recorder manager gracefully
+    # Shutdown recorder manager
     if recorder_manager:
         await recorder_manager.shutdown()
-        print(f"{bcolors.OKGREEN}Recorder manager shut down{bcolors.ENDC}")
+        LogUtil.success("Recorder manager shut down")
 
-    # Close WAV file if it's open
+    # Close WAV file if open
     if wav_file:
         try:
             wav_file.close()
-            print(f"{bcolors.OKGREEN}WAV file closed{bcolors.ENDC}")
+            LogUtil.success("WAV file closed")
         except Exception as e:
-            debug_print(f"Error closing WAV file: {e}")
+            LogUtil.error("Error closing WAV file", e)
 
     # Print final metrics
-    print(f"{bcolors.OKCYAN}[FINAL METRICS] Uptime: {server_metrics.get_uptime():.1f}s, "
-          f"Total connections: {server_metrics.total_connections}, "
-          f"Audio chunks processed: {server_metrics.audio_chunks_processed}, "
-          f"Total errors: {server_metrics.transcription_errors + server_metrics.recorder_errors}{bcolors.ENDC}")
+    LogUtil.success(
+        f"[FINAL METRICS] "
+        f"Uptime: {server_metrics.get_uptime():.1f}s, "
+        f"Total connections: {server_metrics.total_connections}, "
+        f"Audio chunks: {server_metrics.audio_chunks_processed}, "
+        f"Errors: {server_metrics.transcription_errors + server_metrics.recorder_errors}"
+    )
 
-    # Cancel all remaining tasks
+    # Cancel remaining tasks
     tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
     for task in tasks:
         task.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
-
-    print(f"{bcolors.OKGREEN}Graceful shutdown complete.{bcolors.ENDC}")
 
 def main():
     try:
