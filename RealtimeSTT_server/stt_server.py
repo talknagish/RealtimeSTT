@@ -501,21 +501,63 @@ class HybridRecorderManager:
         """Reset recorder state without blocking"""
         try:
             if self.recorder:
+                # Reset all critical state variables
                 self.recorder.post_speech_silence_duration = global_args.unknown_sentence_detection_pause
+                self.recorder.clear_audio_queue()
+                
+                # Reset internal state tracking
+                self.processing_state = "idle"
+                self.text_repeat_count = 0
+                self.last_processed_text = ""
+                
+                # Clear any accumulated audio chunks
+                while not self.audio_queue.empty():
+                    try:
+                        self.audio_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                
+                print(f"{bcolors.OKGREEN}[DEBUG] Successfully reset recorder state{bcolors.ENDC}")
         except Exception as e:
             print(f"{bcolors.WARNING}[DEBUG] Error in reset_recorder_state: {e}{bcolors.ENDC}")
+            recorder_health.record_error()
     
     async def process_audio(self, audio_data: bytes):
         """Process audio data asynchronously"""
         if not self.recorder or recorder_health.state == RecorderState.ERROR:
             return
         
-        # Check if recorder is in a stuck state
-        if self.processing_state == "stuck":
-            print(f"{bcolors.WARNING}[DEBUG] Recorder is stuck, skipping audio processing{bcolors.ENDC}")
-            return
-        
         try:
+            current_time = time.time()
+            
+            # Check if we need to recover from a stuck state
+            if self.processing_state == "stuck":
+                # If we're receiving new audio after being stuck, attempt recovery
+                if not hasattr(self, '_last_stuck_recovery') or \
+                   current_time - self._last_stuck_recovery > 2.0:  # Allow recovery every 2 seconds
+                    print(f"{bcolors.WARNING}[DEBUG] Attempting recovery from stuck state due to new audio{bcolors.ENDC}")
+                    await self._attempt_recovery()
+                    self._last_stuck_recovery = current_time
+                    # Continue processing this chunk after recovery
+                else:
+                    print(f"{bcolors.WARNING}[DEBUG] Skipping audio chunk while in recovery cooldown{bcolors.ENDC}")
+                    return
+            
+            # Track audio chunk timing for detecting rapid stop/start
+            if not hasattr(self, '_last_audio_chunks'):
+                self._last_audio_chunks = []
+            self._last_audio_chunks.append(current_time)
+            # Keep only last 5 seconds of chunks
+            self._last_audio_chunks = [t for t in self._last_audio_chunks if current_time - t <= 5.0]
+            
+            # Detect rapid stop/start pattern
+            if len(self._last_audio_chunks) >= 2:
+                gaps = [self._last_audio_chunks[i] - self._last_audio_chunks[i-1] 
+                       for i in range(1, len(self._last_audio_chunks))]
+                if any(gap > 0.5 for gap in gaps) and any(gap < 0.1 for gap in gaps):
+                    print(f"{bcolors.WARNING}[DEBUG] Detected rapid stop/start pattern, ensuring clean state{bcolors.ENDC}")
+                    await self._attempt_recovery()
+            
             # Put audio in queue for recorder thread
             self.audio_queue.put(audio_data)
             
@@ -524,9 +566,12 @@ class HybridRecorderManager:
             server_metrics.audio_chunks_processed += 1
             server_metrics.reset_activity()
             
-            # Update processing state
+            # Update processing state and monitoring
             if self.processing_state == "idle":
                 self.processing_state = "processing"
+            
+            # Reset error counters on successful processing
+            recorder_health.consecutive_errors = 0
                 
         except Exception as e:
             print(f"{bcolors.FAIL}[ERROR] Error processing audio: {e}{bcolors.ENDC}")
