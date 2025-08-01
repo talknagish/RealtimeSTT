@@ -94,14 +94,10 @@ silence_timing = False
 writechunks = False
 wav_file = None
 
-# Background noise detection control
-enable_background_noise_detection = False  # Set to True to enable background noise detection
-
-# Background noise detection parameters - made less aggressive to avoid stopping normal speech
-hard_break_even_on_background_noise = 5.0  # Increased from 3.0
-hard_break_even_on_background_noise_min_texts = 5  # Increased from 3
-hard_break_even_on_background_noise_min_similarity = 0.995  # Increased from 0.99 (requires higher similarity)
-hard_break_even_on_background_noise_min_chars = 25  # Increased from 15
+hard_break_even_on_background_noise = 3.0
+hard_break_even_on_background_noise_min_texts = 3
+hard_break_even_on_background_noise_min_similarity = 0.99
+hard_break_even_on_background_noise_min_chars = 15
 
 
 text_time_deque = deque()
@@ -185,7 +181,6 @@ allowed_methods = [
     'wakeup',
     'shutdown',
     'text',
-    'reset',  # Add reset method for manual recovery
 ]
 allowed_parameters = [
     'language',
@@ -257,14 +252,6 @@ def text_detected(text, loop):
     global prev_text, audio_queue
 
     text = preprocess_text(text)
-    
-    # Add recovery mechanism - if we get text after a long silence, wake up the recorder
-    if not recorder.is_recording and text.strip():
-        try:
-            recorder.wakeup()
-            debug_print("Recorder was stuck, woke it up")
-        except Exception as e:
-            debug_print(f"Error waking up recorder: {e}")
 
     if silence_timing:
         def ends_with_ellipsis(text: str):
@@ -298,7 +285,7 @@ def text_detected(text, loop):
             text_time_deque.popleft()
 
         # Check if at least hard_break_even_on_background_noise_min_texts texts have arrived within the last hard_break_even_on_background_noise seconds
-        if enable_background_noise_detection and len(text_time_deque) >= hard_break_even_on_background_noise_min_texts:
+        if len(text_time_deque) >= hard_break_even_on_background_noise_min_texts:
             texts = [t[1] for t in text_time_deque]
             first_text = texts[0]
             last_text = texts[-1]
@@ -563,9 +550,6 @@ def parse_arguments():
     parser.add_argument('--faster_whisper_vad_filter', action='store_true',
                         help='Enable VAD filter for Faster Whisper. Default is False.')
 
-    parser.add_argument('--enable_background_noise_detection', action='store_true',
-                        help='Enable background noise detection to automatically stop recording when similar text is detected repeatedly. Default is False.')
-
     parser.add_argument('--logchunks', action='store_true', help='Enable logging of incoming audio chunks (periods)')
 
     # Parse arguments
@@ -576,10 +560,6 @@ def parse_arguments():
     writechunks = args.write
     log_incoming_chunks = args.logchunks
     dynamic_silence_timing = args.silence_timing
-    
-    # Set global background noise detection flag
-    global enable_background_noise_detection
-    enable_background_noise_detection = args.enable_background_noise_detection
 
 
     ws_logger = logging.getLogger('websockets')
@@ -636,20 +616,7 @@ def _recorder_thread(loop):
             print(f"\r[{timestamp}] {bcolors.BOLD}Sentence:{bcolors.ENDC} {bcolors.OKGREEN}{full_sentence}{bcolors.ENDC}\n")
     try:
         while not stop_recorder:
-            try:
-                # This is the correct pattern - recorder.text() is blocking and waits for text
-                # If it gets stuck, we need to handle it properly
-                recorder.text(process_text)
-            except Exception as text_error:
-                # If text() method throws an error, log it and try to recover
-                debug_print(f"Error in recorder.text(): {text_error}")
-                # Try to abort and restart the recorder if it's stuck
-                try:
-                    recorder.abort()
-                    time.sleep(0.1)  # Brief pause before continuing
-                except Exception as abort_error:
-                    debug_print(f"Error aborting recorder: {abort_error}")
-                continue
+            recorder.text(process_text)
     except KeyboardInterrupt:
         print(f"{bcolors.WARNING}Exiting application due to keyboard interrupt{bcolors.ENDC}")
     except Exception as e:
@@ -745,30 +712,17 @@ async def control_handler(websocket):
                     elif command == "call_method":
                         method_name = command_data.get("method")
                         if method_name in allowed_methods:
-                            if method_name == "reset":
-                                # Custom reset method to recover from stuck state
-                                try:
-                                    recorder.abort()
-                                    recorder.clear_audio_queue()
-                                    time.sleep(0.1)  # Brief pause
-                                    timestamp = datetime.now().strftime('%H:%M:%S.%f')[:-3]
-                                    print(f"  [{timestamp}] {bcolors.OKGREEN}Reset recorder to recover from stuck state{bcolors.ENDC}")
-                                    await websocket.send(json.dumps({"status": "success", "message": "Recorder reset successfully"}))
-                                except Exception as reset_error:
-                                    debug_print(f"Error resetting recorder: {reset_error}")
-                                    await websocket.send(json.dumps({"status": "error", "message": f"Error resetting recorder: {reset_error}"}))
+                            method = getattr(recorder, method_name, None)
+                            if method and callable(method):
+                                args = command_data.get("args", [])
+                                kwargs = command_data.get("kwargs", {})
+                                method(*args, **kwargs)
+                                timestamp = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+                                print(f"  [{timestamp}] {bcolors.OKGREEN}Called method recorder.{bcolors.OKBLUE}{method_name}{bcolors.ENDC}")
+                                await websocket.send(json.dumps({"status": "success", "message": f"Method {method_name} called"}))
                             else:
-                                method = getattr(recorder, method_name, None)
-                                if method and callable(method):
-                                    args = command_data.get("args", [])
-                                    kwargs = command_data.get("kwargs", {})
-                                    method(*args, **kwargs)
-                                    timestamp = datetime.now().strftime('%H:%M:%S.%f')[:-3]
-                                    print(f"  [{timestamp}] {bcolors.OKGREEN}Called method recorder.{bcolors.OKBLUE}{method_name}{bcolors.ENDC}")
-                                    await websocket.send(json.dumps({"status": "success", "message": f"Method {method_name} called"}))
-                                else:
-                                    print(f"{bcolors.WARNING}Recorder does not have method {method_name}{bcolors.ENDC}")
-                                    await websocket.send(json.dumps({"status": "error", "message": f"Recorder does not have method {method_name}"}))
+                                print(f"{bcolors.WARNING}Recorder does not have method {method_name}{bcolors.ENDC}")
+                                await websocket.send(json.dumps({"status": "error", "message": f"Recorder does not have method {method_name}"}))
                         else:
                             print(f"{bcolors.WARNING}Method {method_name} is not allowed{bcolors.ENDC}")
                             await websocket.send(json.dumps({"status": "error", "message": f"Method {method_name} is not allowed"}))
@@ -891,8 +845,12 @@ def make_callback(loop, callback):
 
 # Simple HTTP health check server
 async def health_check_handler(request):
-    """Simple HTTP health check endpoint that returns 200 OK"""
-    return web.Response(text="OK", content_type="text/plain")
+    """HTTP health check endpoint that returns 200 OK only when RealtimeSTT is initialized"""
+    global recorder_ready, recorder
+    if recorder_ready.is_set() and recorder is not None:
+        return web.Response(text="OK", content_type="text/plain")
+    else:
+        return web.Response(text="Initializing...", status=503, content_type="text/plain")
 
 async def start_health_check_server(port=8080):
     """Start a simple HTTP health check server on the specified port"""
