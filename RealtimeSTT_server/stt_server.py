@@ -326,11 +326,16 @@ class HybridRecorderManager:
             
             # Create recorder and override callbacks
             self.recorder = AudioToTextRecorder(**self.config)
+            
+            # Verify recorder was created successfully
+            if not self.recorder:
+                raise RuntimeError("Failed to create AudioToTextRecorder instance")
+                
             for callback_name, callback_func in callbacks.items():
                 setattr(self.recorder, callback_name, callback_func)
             
-            # Add reset method to recorder object
-            self.recorder.reset_recorder_state = self._reset_recorder_state
+            # Note: We don't add reset method to recorder object as it's not needed
+            # The reset functionality is handled by the manager's _reset_recorder_state method
             
             # Force override any internal callback references
             if hasattr(self.recorder, '_callbacks'):
@@ -368,7 +373,8 @@ class HybridRecorderManager:
                     if current_time - last_processing_time > watchdog_timeout:
                         print(f"{bcolors.WARNING}[DEBUG] Recorder watchdog timeout, clearing audio queue{bcolors.ENDC}")
                         try:
-                            self.recorder.clear_audio_queue()
+                            if hasattr(self.recorder, 'clear_audio_queue'):
+                                self.recorder.clear_audio_queue()
                             self._reset_recorder_state()
                         except Exception as e:
                             print(f"{bcolors.WARNING}[DEBUG] Error clearing audio queue: {e}{bcolors.ENDC}")
@@ -483,7 +489,8 @@ class HybridRecorderManager:
             
             # Try to clear audio queue and reset state
             if self.recorder:
-                await asyncio.to_thread(self.recorder.clear_audio_queue)
+                if hasattr(self.recorder, 'clear_audio_queue'):
+                    await asyncio.to_thread(self.recorder.clear_audio_queue)
                 self._reset_recorder_state()
                 # Reset state management
                 self.last_processed_text = ""
@@ -502,8 +509,12 @@ class HybridRecorderManager:
         try:
             if self.recorder:
                 # Reset all critical state variables
-                self.recorder.post_speech_silence_duration = global_args.unknown_sentence_detection_pause
-                self.recorder.clear_audio_queue()
+                if hasattr(global_args, 'unknown_sentence_detection_pause'):
+                    self.recorder.post_speech_silence_duration = global_args.unknown_sentence_detection_pause
+                
+                # Clear audio queue if method exists
+                if hasattr(self.recorder, 'clear_audio_queue'):
+                    self.recorder.clear_audio_queue()
                 
                 # Reset internal state tracking
                 self.processing_state = "idle"
@@ -518,6 +529,8 @@ class HybridRecorderManager:
                         break
                 
                 print(f"{bcolors.OKGREEN}[DEBUG] Successfully reset recorder state{bcolors.ENDC}")
+            else:
+                print(f"{bcolors.WARNING}[DEBUG] Cannot reset recorder state - recorder not available{bcolors.ENDC}")
         except Exception as e:
             print(f"{bcolors.WARNING}[DEBUG] Error in reset_recorder_state: {e}{bcolors.ENDC}")
             recorder_health.record_error()
@@ -525,9 +538,15 @@ class HybridRecorderManager:
     async def process_audio(self, audio_data: bytes):
         """Process audio data asynchronously"""
         if not self.recorder or recorder_health.state == RecorderState.ERROR:
+            print(f"{bcolors.WARNING}[DEBUG] Cannot process audio - recorder not ready or in error state{bcolors.ENDC}")
             return
         
         try:
+            # Ensure recorder is ready
+            if not self.recorder or not hasattr(self.recorder, 'feed_audio'):
+                print(f"{bcolors.WARNING}[DEBUG] Recorder not ready for audio processing{bcolors.ENDC}")
+                return
+                
             current_time = time.time()
             
             # Check if we need to recover from a stuck state
@@ -644,7 +663,6 @@ allowed_methods = [
     'wakeup',
     'shutdown',
     'text',
-    'reset_recorder_state',
 ]
 allowed_parameters = [
     'language',
@@ -813,6 +831,8 @@ def reset_recorder_state():
     if recorder_manager and recorder_manager.recorder:
         try:
             recorder_manager.recorder.post_speech_silence_duration = global_args.unknown_sentence_detection_pause
+            # Also call the internal reset method
+            recorder_manager._reset_recorder_state()
             print(f"{bcolors.OKGREEN}[DEBUG] Recorder state reset{bcolors.ENDC}")
         except Exception as e:
             print(f"{bcolors.WARNING}[DEBUG] Error resetting recorder state: {e}{bcolors.ENDC}")
@@ -1224,7 +1244,8 @@ async def data_handler(websocket):
             prev_text = ""  # Reset global prev_text
             
             # Clear all queues
-            await recorder_manager.recorder.clear_audio_queue()
+            if hasattr(recorder_manager.recorder, 'clear_audio_queue'):
+                await asyncio.to_thread(recorder_manager.recorder.clear_audio_queue)
             while not recorder_manager.audio_queue.empty():
                 try:
                     recorder_manager.audio_queue.get_nowait()
@@ -1244,7 +1265,7 @@ async def data_handler(websocket):
                     break
             
             # Reset recorder's internal state
-            await asyncio.to_thread(recorder_manager.recorder.reset_recorder_state)
+            await asyncio.to_thread(recorder_manager._reset_recorder_state)
             
             # Reset health monitoring state
             recorder_health.state = RecorderState.READY
