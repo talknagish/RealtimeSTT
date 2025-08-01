@@ -94,10 +94,14 @@ silence_timing = False
 writechunks = False
 wav_file = None
 
-hard_break_even_on_background_noise = 3.0
-hard_break_even_on_background_noise_min_texts = 3
-hard_break_even_on_background_noise_min_similarity = 0.99
-hard_break_even_on_background_noise_min_chars = 15
+# Background noise detection control
+enable_background_noise_detection = False  # Set to True to enable background noise detection
+
+# Background noise detection parameters - made less aggressive to avoid stopping normal speech
+hard_break_even_on_background_noise = 5.0  # Increased from 3.0
+hard_break_even_on_background_noise_min_texts = 5  # Increased from 3
+hard_break_even_on_background_noise_min_similarity = 0.995  # Increased from 0.99 (requires higher similarity)
+hard_break_even_on_background_noise_min_chars = 25  # Increased from 15
 
 
 text_time_deque = deque()
@@ -252,6 +256,14 @@ def text_detected(text, loop):
     global prev_text, audio_queue
 
     text = preprocess_text(text)
+    
+    # Add recovery mechanism - if we get text after a long silence, wake up the recorder
+    if not recorder.is_recording and text.strip():
+        try:
+            recorder.wakeup()
+            debug_print("Recorder was stuck, woke it up")
+        except Exception as e:
+            debug_print(f"Error waking up recorder: {e}")
 
     if silence_timing:
         def ends_with_ellipsis(text: str):
@@ -285,7 +297,7 @@ def text_detected(text, loop):
             text_time_deque.popleft()
 
         # Check if at least hard_break_even_on_background_noise_min_texts texts have arrived within the last hard_break_even_on_background_noise seconds
-        if len(text_time_deque) >= hard_break_even_on_background_noise_min_texts:
+        if enable_background_noise_detection and len(text_time_deque) >= hard_break_even_on_background_noise_min_texts:
             texts = [t[1] for t in text_time_deque]
             first_text = texts[0]
             last_text = texts[-1]
@@ -550,6 +562,9 @@ def parse_arguments():
     parser.add_argument('--faster_whisper_vad_filter', action='store_true',
                         help='Enable VAD filter for Faster Whisper. Default is False.')
 
+    parser.add_argument('--enable_background_noise_detection', action='store_true',
+                        help='Enable background noise detection to automatically stop recording when similar text is detected repeatedly. Default is False.')
+
     parser.add_argument('--logchunks', action='store_true', help='Enable logging of incoming audio chunks (periods)')
 
     # Parse arguments
@@ -560,6 +575,10 @@ def parse_arguments():
     writechunks = args.write
     log_incoming_chunks = args.logchunks
     dynamic_silence_timing = args.silence_timing
+    
+    # Set global background noise detection flag
+    global enable_background_noise_detection
+    enable_background_noise_detection = args.enable_background_noise_detection
 
 
     ws_logger = logging.getLogger('websockets')
