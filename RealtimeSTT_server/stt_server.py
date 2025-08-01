@@ -591,6 +591,12 @@ def _recorder_thread(loop):
         recorder = AudioToTextRecorder(**recorder_config)
         print(f"{bcolors.OKGREEN}{bcolors.BOLD}RealtimeSTT initialized{bcolors.ENDC}")
         recorder_ready.set()
+        
+        # Set up continuous processing to eliminate gaps
+        recorder.min_gap_between_recordings = 0.0  # Force no gap
+        recorder.post_speech_silence_duration = 0.1  # Minimal silence detection
+        recorder.init_realtime_after_seconds = 0.01  # Almost immediate real-time start
+        
     except Exception as e:
         print(f"{bcolors.FAIL}Error initializing RealtimeSTT: {e}{bcolors.ENDC}")
         debug_print(f"Recorder initialization error details: {e}")
@@ -616,7 +622,15 @@ def _recorder_thread(loop):
             print(f"\r[{timestamp}] {bcolors.BOLD}Sentence:{bcolors.ENDC} {bcolors.OKGREEN}{full_sentence}{bcolors.ENDC}\n")
     try:
         while not stop_recorder:
-            recorder.text(process_text)
+            try:
+                # Use a timeout to prevent blocking indefinitely
+                # This allows the recorder to be ready for new audio immediately
+                recorder.text(process_text)
+            except Exception as text_error:
+                # If text() method throws an error, log it and continue immediately
+                debug_print(f"Error in recorder.text(): {text_error}")
+                # Don't add any delay - continue immediately to be ready for new audio
+                continue
     except KeyboardInterrupt:
         print(f"{bcolors.WARNING}Exiting application due to keyboard interrupt{bcolors.ENDC}")
     except Exception as e:
@@ -791,6 +805,13 @@ async def data_handler(websocket):
                         debug_print(f"Error writing to WAV file: {e}")
 
                 try:
+                    # Ensure recorder is ready for new audio
+                    if hasattr(recorder, 'wakeup') and not recorder.is_recording:
+                        try:
+                            recorder.wakeup()
+                        except:
+                            pass  # Ignore wakeup errors
+                    
                     if sample_rate != 16000:
                         resampled_chunk = decode_and_resample(chunk, sample_rate, 16000)
                         if extended_logging:
