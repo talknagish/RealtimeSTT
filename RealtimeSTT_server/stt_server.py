@@ -185,6 +185,7 @@ allowed_methods = [
     'wakeup',
     'shutdown',
     'text',
+    'reset',  # Add reset method for manual recovery
 ]
 allowed_parameters = [
     'language',
@@ -635,7 +636,20 @@ def _recorder_thread(loop):
             print(f"\r[{timestamp}] {bcolors.BOLD}Sentence:{bcolors.ENDC} {bcolors.OKGREEN}{full_sentence}{bcolors.ENDC}\n")
     try:
         while not stop_recorder:
-            recorder.text(process_text)
+            try:
+                # This is the correct pattern - recorder.text() is blocking and waits for text
+                # If it gets stuck, we need to handle it properly
+                recorder.text(process_text)
+            except Exception as text_error:
+                # If text() method throws an error, log it and try to recover
+                debug_print(f"Error in recorder.text(): {text_error}")
+                # Try to abort and restart the recorder if it's stuck
+                try:
+                    recorder.abort()
+                    time.sleep(0.1)  # Brief pause before continuing
+                except Exception as abort_error:
+                    debug_print(f"Error aborting recorder: {abort_error}")
+                continue
     except KeyboardInterrupt:
         print(f"{bcolors.WARNING}Exiting application due to keyboard interrupt{bcolors.ENDC}")
     except Exception as e:
@@ -731,17 +745,30 @@ async def control_handler(websocket):
                     elif command == "call_method":
                         method_name = command_data.get("method")
                         if method_name in allowed_methods:
-                            method = getattr(recorder, method_name, None)
-                            if method and callable(method):
-                                args = command_data.get("args", [])
-                                kwargs = command_data.get("kwargs", {})
-                                method(*args, **kwargs)
-                                timestamp = datetime.now().strftime('%H:%M:%S.%f')[:-3]
-                                print(f"  [{timestamp}] {bcolors.OKGREEN}Called method recorder.{bcolors.OKBLUE}{method_name}{bcolors.ENDC}")
-                                await websocket.send(json.dumps({"status": "success", "message": f"Method {method_name} called"}))
+                            if method_name == "reset":
+                                # Custom reset method to recover from stuck state
+                                try:
+                                    recorder.abort()
+                                    recorder.clear_audio_queue()
+                                    time.sleep(0.1)  # Brief pause
+                                    timestamp = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+                                    print(f"  [{timestamp}] {bcolors.OKGREEN}Reset recorder to recover from stuck state{bcolors.ENDC}")
+                                    await websocket.send(json.dumps({"status": "success", "message": "Recorder reset successfully"}))
+                                except Exception as reset_error:
+                                    debug_print(f"Error resetting recorder: {reset_error}")
+                                    await websocket.send(json.dumps({"status": "error", "message": f"Error resetting recorder: {reset_error}"}))
                             else:
-                                print(f"{bcolors.WARNING}Recorder does not have method {method_name}{bcolors.ENDC}")
-                                await websocket.send(json.dumps({"status": "error", "message": f"Recorder does not have method {method_name}"}))
+                                method = getattr(recorder, method_name, None)
+                                if method and callable(method):
+                                    args = command_data.get("args", [])
+                                    kwargs = command_data.get("kwargs", {})
+                                    method(*args, **kwargs)
+                                    timestamp = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+                                    print(f"  [{timestamp}] {bcolors.OKGREEN}Called method recorder.{bcolors.OKBLUE}{method_name}{bcolors.ENDC}")
+                                    await websocket.send(json.dumps({"status": "success", "message": f"Method {method_name} called"}))
+                                else:
+                                    print(f"{bcolors.WARNING}Recorder does not have method {method_name}{bcolors.ENDC}")
+                                    await websocket.send(json.dumps({"status": "error", "message": f"Recorder does not have method {method_name}"}))
                         else:
                             print(f"{bcolors.WARNING}Method {method_name} is not allowed{bcolors.ENDC}")
                             await websocket.send(json.dumps({"status": "error", "message": f"Method {method_name} is not allowed"}))
