@@ -8,8 +8,6 @@ This server provides real-time speech-to-text (STT) transcription using the Real
 - WebSocket-based communication for control and data handling.
 - Flexible recording and transcription options, including configurable pauses for sentence detection.
 - Supports Silero and WebRTC VAD for robust voice activity detection.
-- Production-ready with support for thousands of concurrent calls.
-- Self-healing architecture with no hard-coded delays.
 
 ### Starting the Server:
 You can start the server using the command-line interface (CLI) command `stt-server`, passing the desired configuration options.
@@ -86,74 +84,8 @@ import asyncio
 import pyaudio
 import base64
 import sys
-import time
-import weakref
-from typing import Dict, Set, Optional, Any
-from dataclasses import dataclass, field
-from enum import Enum
-import queue
-import threading
 
-# Production-ready metrics and monitoring
-@dataclass
-class ServerMetrics:
-    """Production metrics for monitoring server health and performance"""
-    active_connections: int = 0
-    total_connections: int = 0
-    audio_chunks_processed: int = 0
-    transcription_errors: int = 0
-    recorder_errors: int = 0
-    last_activity: float = field(default_factory=time.time)
-    start_time: float = field(default_factory=time.time)
-    
-    def reset_activity(self):
-        self.last_activity = time.time()
-    
-    def get_uptime(self) -> float:
-        return time.time() - self.start_time
-    
-    def get_connections_per_minute(self) -> float:
-        uptime = self.get_uptime()
-        return (self.total_connections / uptime) * 60 if uptime > 0 else 0
 
-class RecorderState(Enum):
-    """Recorder state enumeration for better state management"""
-    INITIALIZING = "initializing"
-    READY = "ready"
-    PROCESSING = "processing"
-    ERROR = "error"
-    RECOVERING = "recovering"
-    SHUTDOWN = "shutdown"
-
-@dataclass
-class RecorderHealth:
-    """Health monitoring for the recorder"""
-    state: RecorderState = RecorderState.INITIALIZING
-    last_successful_processing: float = field(default_factory=time.time)
-    consecutive_errors: int = 0
-    error_threshold: int = 5
-    recovery_attempts: int = 0
-    max_recovery_attempts: int = 10
-    
-    def record_success(self):
-        self.state = RecorderState.READY
-        self.last_successful_processing = time.time()
-        self.consecutive_errors = 0
-        self.recovery_attempts = 0
-    
-    def record_error(self):
-        self.consecutive_errors += 1
-        if self.consecutive_errors >= self.error_threshold:
-            self.state = RecorderState.ERROR
-    
-    def start_recovery(self):
-        self.state = RecorderState.RECOVERING
-        self.recovery_attempts += 1
-    
-    def can_recover(self) -> bool:
-        return self.recovery_attempts < self.max_recovery_attempts
-
-# Global state management
 debug_logging = False
 extended_logging = False
 send_recorded_chunk = False
@@ -162,14 +94,11 @@ silence_timing = False
 writechunks = False
 wav_file = None
 
-# Production metrics
-server_metrics = ServerMetrics()
-recorder_health = RecorderHealth()
-
 hard_break_even_on_background_noise = 3.0
 hard_break_even_on_background_noise_min_texts = 3
 hard_break_even_on_background_noise_min_similarity = 0.99
 hard_break_even_on_background_noise_min_chars = 15
+
 
 text_time_deque = deque()
 loglevel = logging.WARNING
@@ -177,8 +106,10 @@ loglevel = logging.WARNING
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
 
+
 if sys.platform == 'win32':
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 
 check_and_install_packages([
     {
@@ -213,7 +144,7 @@ class bcolors:
     BOLD = '\033[1m'
     UNDERLINE = '\033[4m'
 
-print(f"{bcolors.BOLD}{bcolors.OKCYAN}Starting production-ready STT server, please wait...{bcolors.ENDC}")
+print(f"{bcolors.BOLD}{bcolors.OKCYAN}Starting server, please wait...{bcolors.ENDC}")
 
 # Initialize colorama
 from colorama import init, Fore, Style
@@ -227,431 +158,18 @@ from websockets.asyncio.server import serve
 from websockets.exceptions import ConnectionClosed
 import aiohttp
 from aiohttp import web
+import threading
 import logging
 import wave
 import json
+import time
 
-# Production-ready hybrid recorder manager (thread-based recorder with async communication)
-class HybridRecorderManager:
-    """Hybrid recorder manager with thread-based recorder and async communication"""
-    
-    def __init__(self, config: dict, loop: asyncio.AbstractEventLoop):
-        self.config = config
-        self.loop = loop
-        self.recorder: Optional[AudioToTextRecorder] = None
-        self.recorder_thread: Optional[threading.Thread] = None
-        self.health_task: Optional[asyncio.Task] = None
-        self.ready_event = asyncio.Event()
-        self.shutdown_event = asyncio.Event()
-        self.error_event = asyncio.Event()
-        self.processing_lock = asyncio.Lock()
-        self.recorder_ready = threading.Event()
-        self.stop_recorder = False
-        
-        # Thread-safe queues for communication
-        self.audio_queue = queue.Queue()
-        self.result_queue = queue.Queue()
-        self.callback_queue = queue.Queue()
-        self._last_activity_check = time.time()
-        
-        # State management to prevent stuck loops
-        self.last_processed_text = ""
-        self.text_repeat_count = 0
-        self.max_text_repeats = 3
-        self.processing_state = "idle"  # idle, processing, stuck
-        
-    async def initialize(self):
-        """Initialize the recorder in a separate thread"""
-        try:
-            recorder_health.state = RecorderState.INITIALIZING
-            print(f"{bcolors.OKGREEN}Initializing production-ready RealtimeSTT server with parameters:{bcolors.ENDC}")
-            for key, value in self.config.items():
-                print(f"    {bcolors.OKBLUE}{key}{bcolors.ENDC}: {value}")
-            
-            # Start recorder in separate thread
-            self.recorder_thread = threading.Thread(target=self._recorder_thread_worker, daemon=True)
-            self.recorder_thread.start()
-            
-            # Wait for recorder to be ready
-            await asyncio.to_thread(self.recorder_ready.wait)
-            
-            print(f"{bcolors.OKGREEN}{bcolors.BOLD}RealtimeSTT initialized successfully{bcolors.ENDC}")
-            recorder_health.record_success()
-            self.ready_event.set()
-            
-            # Start monitoring tasks
-            self.health_task = asyncio.create_task(self._health_monitor())
-            
-        except Exception as e:
-            print(f"{bcolors.FAIL}[ERROR] Failed to initialize recorder: {e}{bcolors.ENDC}")
-            recorder_health.record_error()
-            self.error_event.set()
-            raise
-    
-    def _create_thread_safe_callback(self, callback_func):
-        """Create a thread-safe callback that queues the call for async processing"""
-        def thread_safe_callback(*args, **kwargs):
-            try:
-                self.callback_queue.put((callback_func, args, kwargs))
-            except Exception as e:
-                print(f"{bcolors.FAIL}[ERROR] Error in thread-safe callback: {e}{bcolors.ENDC}")
-        return thread_safe_callback
-    
-    def _recorder_thread_worker(self):
-        """Worker thread for the recorder - runs the blocking recorder operations"""
-        try:
-            # Create thread-safe callback wrappers
-            def thread_safe_text_detected(text):
-                print(f"{bcolors.OKGREEN}[DEBUG] Thread-safe text_detected called with: '{text}'{bcolors.ENDC}")
-                self.callback_queue.put((text_detected_async, (text, self.loop), {}))
-            
-            # Create event handlers for each event type
-            def create_event_handler(event_type):
-                return lambda *args: self.callback_queue.put((_handle_event_async, (event_type, *args, self.loop), {}))
-            
-            callbacks = {
-                event: create_event_handler(event.replace('on_', '').replace('_', ' '))
-                for event in [
-                    'on_recording_start', 'on_recording_stop',
-                    'on_vad_detect_start', 'on_vad_detect_stop',
-                    'on_turn_detection_start', 'on_turn_detection_stop'
-                ]
-            }
-            
-            # Special handlers for text-based events
-            callbacks.update({
-                'on_realtime_transcription_update': thread_safe_text_detected,
-                'on_realtime_transcription_stabilized': thread_safe_text_detected
-            })
-            
-            # Create recorder and override callbacks
-            self.recorder = AudioToTextRecorder(**self.config)
-            
-            # Verify recorder was created successfully
-            if not self.recorder:
-                raise RuntimeError("Failed to create AudioToTextRecorder instance")
-                
-            for callback_name, callback_func in callbacks.items():
-                setattr(self.recorder, callback_name, callback_func)
-            
-            # Note: We don't add reset method to recorder object as it's not needed
-            # The reset functionality is handled by the manager's _reset_recorder_state method
-            
-            # Force override any internal callback references
-            if hasattr(self.recorder, '_callbacks'):
-                self.recorder._callbacks.update({
-                    'on_realtime_transcription_update': callbacks['on_realtime_transcription_update'],
-                    'on_realtime_transcription_stabilized': callbacks['on_realtime_transcription_stabilized']
-                })
-            
-            # Monkey patch the recorder's callback calling mechanism
-            if original_run_callback := getattr(self.recorder, '_run_callback', None):
-                def thread_safe_run_callback(callback, *args, **kwargs):
-                    if callback == getattr(self.recorder, 'on_realtime_transcription_update', None):
-                        callbacks['on_realtime_transcription_update'](*args, **kwargs)
-                    else:
-                        original_run_callback(callback, *args, **kwargs)
-                setattr(self.recorder, '_run_callback', thread_safe_run_callback)
-            
-            print(f"{bcolors.OKGREEN}[DEBUG] Recorder callbacks overridden with thread-safe versions{bcolors.ENDC}")
-            
-            # Signal that recorder is ready
-            self.recorder_ready.set()
-            
-            # Main processing loop with thread-safe text processing
-            def process_text(full_sentence):
-                self.result_queue.put(('full_sentence', full_sentence))
-            
-            # Add watchdog timer to prevent getting stuck
-            last_processing_time = time.time()
-            watchdog_timeout = 30  # 30 seconds timeout
-            
-            while not self.stop_recorder:
-                try:
-                    # Check if we've been processing too long without progress
-                    current_time = time.time()
-                    if current_time - last_processing_time > watchdog_timeout:
-                        print(f"{bcolors.WARNING}[DEBUG] Recorder watchdog timeout, clearing audio queue{bcolors.ENDC}")
-                        try:
-                            if hasattr(self.recorder, 'clear_audio_queue'):
-                                self.recorder.clear_audio_queue()
-                            self._reset_recorder_state()
-                        except Exception as e:
-                            print(f"{bcolors.WARNING}[DEBUG] Error clearing audio queue: {e}{bcolors.ENDC}")
-                        last_processing_time = current_time
-                    
-                    # Process text - this is the blocking operation
-                    self.recorder.text(process_text)
-                    recorder_health.record_success()
-                    server_metrics.reset_activity()
-                    
-                    # Update activity time to prevent stuck detection
-                    if hasattr(self, '_last_activity_check'):
-                        self._last_activity_check = time.time()
-                    
-                    # Update processing time
-                    last_processing_time = time.time()
-                    
-                except Exception as e:
-                    print(f"{bcolors.FAIL}[ERROR] Recorder thread error: {e}{bcolors.ENDC}")
-                    server_metrics.recorder_errors += 1
-                    recorder_health.record_error()
-                    
-        except Exception as e:
-            print(f"{bcolors.FAIL}[ERROR] Failed to create recorder: {e}{bcolors.ENDC}")
-            recorder_health.record_error()
-    
-    async def _health_monitor(self):
-        """Monitor recorder health without blocking"""
-        last_activity_check = time.time()
-        stuck_threshold = 10  # 10 seconds without activity
-        
-        while not self.shutdown_event.is_set():
-            try:
-                await asyncio.sleep(1)  # Check every second
-                
-                # Check if recorder is responsive
-                if recorder_health.state == RecorderState.ERROR:
-                    await self._attempt_recovery()
-                
-                # Check if recorder is stuck (no activity for too long)
-                current_time = time.time()
-                if hasattr(self, '_last_activity_check'):
-                    if current_time - self._last_activity_check > stuck_threshold:
-                        if recorder_health.state == RecorderState.READY:
-                            print(f"{bcolors.WARNING}[DEBUG] Recorder appears stuck, attempting recovery{bcolors.ENDC}")
-                            recorder_health.record_error()
-                            await self._attempt_recovery()
-                        self._last_activity_check = current_time
-                
-                # Check if recorder is in stuck state (duplicate text detection)
-                if self.processing_state == "stuck":
-                    print(f"{bcolors.FAIL}[DEBUG] Recorder in stuck state, triggering recovery{bcolors.ENDC}")
-                    await self._attempt_recovery()
-                    
-                # Process any results from the recorder thread
-                await self._process_recorder_results()
-                
-                # Process any callbacks from the recorder thread
-                await self._process_callbacks()
-                    
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                print(f"{bcolors.WARNING}[DEBUG] Health monitor error: {e}{bcolors.ENDC}")
-    
-    async def _process_callbacks(self):
-        """Process callbacks from the recorder thread"""
-        try:
-            while not self.callback_queue.empty():
-                callback_func, args, kwargs = self.callback_queue.get_nowait()
-                
-                try:
-                    print(f"{bcolors.OKBLUE}[DEBUG] Processing callback: {callback_func.__name__}{bcolors.ENDC}")
-                    # Execute the callback in the async context
-                    if asyncio.iscoroutinefunction(callback_func):
-                        await callback_func(*args, **kwargs)
-                    else:
-                        # For non-async callbacks, run them in a thread
-                        await asyncio.to_thread(callback_func, *args, **kwargs)
-                        
-                except Exception as e:
-                    print(f"{bcolors.FAIL}[ERROR] Error executing callback: {e}{bcolors.ENDC}")
-                    
-        except queue.Empty:
-            pass
-        except Exception as e:
-            print(f"{bcolors.FAIL}[ERROR] Error processing callbacks: {e}{bcolors.ENDC}")
-    
-    async def _process_recorder_results(self):
-        """Process results from the recorder thread"""
-        try:
-            while not self.result_queue.empty():
-                result_type, data = self.result_queue.get_nowait()
-                
-                if result_type == 'full_sentence':
-                    await self._handle_full_sentence(data)
-                    
-        except queue.Empty:
-            pass
-        except Exception as e:
-            print(f"{bcolors.FAIL}[ERROR] Error processing recorder results: {e}{bcolors.ENDC}")
-    
-    async def _attempt_recovery(self):
-        """Attempt to recover from errors without blocking"""
-        if not recorder_health.can_recover():
-            print(f"{bcolors.FAIL}[ERROR] Max recovery attempts reached{bcolors.ENDC}")
-            return
-        
-        try:
-            recorder_health.start_recovery()
-            print(f"{bcolors.WARNING}[DEBUG] Attempting recorder recovery (attempt {recorder_health.recovery_attempts}){bcolors.ENDC}")
-            
-            # Try to clear audio queue and reset state
-            if self.recorder:
-                if hasattr(self.recorder, 'clear_audio_queue'):
-                    await asyncio.to_thread(self.recorder.clear_audio_queue)
-                self._reset_recorder_state()
-                # Reset state management
-                self.last_processed_text = ""
-                self.text_repeat_count = 0
-                self.processing_state = "idle"
-            
-            recorder_health.record_success()
-            print(f"{bcolors.OKGREEN}[DEBUG] Recorder recovery successful{bcolors.ENDC}")
-            
-        except Exception as e:
-            print(f"{bcolors.FAIL}[ERROR] Recovery attempt failed: {e}{bcolors.ENDC}")
-            recorder_health.record_error()
-    
-    def _reset_recorder_state(self):
-        """Reset recorder state without blocking"""
-        try:
-            if self.recorder:
-                # Reset all critical state variables
-                if hasattr(global_args, 'unknown_sentence_detection_pause'):
-                    self.recorder.post_speech_silence_duration = global_args.unknown_sentence_detection_pause
-                
-                # Clear audio queue if method exists
-                if hasattr(self.recorder, 'clear_audio_queue'):
-                    self.recorder.clear_audio_queue()
-                
-                # Reset internal state tracking
-                self.processing_state = "idle"
-                self.text_repeat_count = 0
-                self.last_processed_text = ""
-                
-                # Clear any accumulated audio chunks
-                while not self.audio_queue.empty():
-                    try:
-                        self.audio_queue.get_nowait()
-                    except queue.Empty:
-                        break
-                
-                print(f"{bcolors.OKGREEN}[DEBUG] Successfully reset recorder state{bcolors.ENDC}")
-            else:
-                print(f"{bcolors.WARNING}[DEBUG] Cannot reset recorder state - recorder not available{bcolors.ENDC}")
-        except Exception as e:
-            print(f"{bcolors.WARNING}[DEBUG] Error in reset_recorder_state: {e}{bcolors.ENDC}")
-            recorder_health.record_error()
-    
-    async def process_audio(self, audio_data: bytes):
-        """Process audio data asynchronously"""
-        if not self.recorder or recorder_health.state == RecorderState.ERROR:
-            print(f"{bcolors.WARNING}[DEBUG] Cannot process audio - recorder not ready or in error state{bcolors.ENDC}")
-            return
-        
-        try:
-            # Ensure recorder is ready
-            if not self.recorder or not hasattr(self.recorder, 'feed_audio'):
-                print(f"{bcolors.WARNING}[DEBUG] Recorder not ready for audio processing{bcolors.ENDC}")
-                return
-                
-            current_time = time.time()
-            
-            # Check if we need to recover from a stuck state
-            if self.processing_state == "stuck":
-                # If we're receiving new audio after being stuck, attempt recovery
-                if not hasattr(self, '_last_stuck_recovery') or \
-                   current_time - self._last_stuck_recovery > 2.0:  # Allow recovery every 2 seconds
-                    print(f"{bcolors.WARNING}[DEBUG] Attempting recovery from stuck state due to new audio{bcolors.ENDC}")
-                    await self._attempt_recovery()
-                    self._last_stuck_recovery = current_time
-                    # Continue processing this chunk after recovery
-                else:
-                    print(f"{bcolors.WARNING}[DEBUG] Skipping audio chunk while in recovery cooldown{bcolors.ENDC}")
-                    return
-            
-            # Track audio chunk timing for detecting rapid stop/start
-            if not hasattr(self, '_last_audio_chunks'):
-                self._last_audio_chunks = []
-            self._last_audio_chunks.append(current_time)
-            # Keep only last 5 seconds of chunks
-            self._last_audio_chunks = [t for t in self._last_audio_chunks if current_time - t <= 5.0]
-            
-            # Detect rapid stop/start pattern
-            if len(self._last_audio_chunks) >= 2:
-                gaps = [self._last_audio_chunks[i] - self._last_audio_chunks[i-1] 
-                       for i in range(1, len(self._last_audio_chunks))]
-                if any(gap > 0.5 for gap in gaps) and any(gap < 0.1 for gap in gaps):
-                    print(f"{bcolors.WARNING}[DEBUG] Detected rapid stop/start pattern, ensuring clean state{bcolors.ENDC}")
-                    await self._attempt_recovery()
-            
-            # Put audio in queue for recorder thread
-            self.audio_queue.put(audio_data)
-            
-            # Feed audio to recorder
-            await asyncio.to_thread(self.recorder.feed_audio, audio_data)
-            server_metrics.audio_chunks_processed += 1
-            server_metrics.reset_activity()
-            
-            # Update processing state and monitoring
-            if self.processing_state == "idle":
-                self.processing_state = "processing"
-            
-            # Reset error counters on successful processing
-            recorder_health.consecutive_errors = 0
-                
-        except Exception as e:
-            print(f"{bcolors.FAIL}[ERROR] Error processing audio: {e}{bcolors.ENDC}")
-            server_metrics.transcription_errors += 1
-            recorder_health.record_error()
-    
-    async def _handle_full_sentence(self, full_sentence: str):
-        """Handle full sentence processing asynchronously"""
-        try:
-            full_sentence = preprocess_text(full_sentence)
-            message = json.dumps({
-                'type': 'fullSentence',
-                'text': full_sentence
-            })
-            
-            await audio_queue.put(message)
-            
-            timestamp = datetime.now().strftime('%H:%M:%S.%f')[:-3]
-            if extended_logging:
-                print(f"  [{timestamp}] Full text: {bcolors.BOLD}Sentence:{bcolors.ENDC} {bcolors.OKGREEN}{full_sentence}{bcolors.ENDC}\n", flush=True, end="")
-            else:
-                print(f"\r[{timestamp}] {bcolors.BOLD}Sentence:{bcolors.ENDC} {bcolors.OKGREEN}{full_sentence}{bcolors.ENDC}\n")
-            
-            # Reset only the text variable, not the entire recorder state
-            global prev_text
-            prev_text = ""
-            
-            # Reset processing state after sentence completion
-            self.processing_state = "idle"
-            self.text_repeat_count = 0
-            self.last_processed_text = ""
-            
-        except Exception as e:
-            print(f"{bcolors.FAIL}[ERROR] Error handling full sentence: {e}{bcolors.ENDC}")
-    
-    async def shutdown(self):
-        """Graceful shutdown"""
-        self.shutdown_event.set()
-        self.stop_recorder = True
-        
-        if self.health_task:
-            self.health_task.cancel()
-            try:
-                await self.health_task
-            except asyncio.CancelledError:
-                pass
-        
-        if self.recorder:
-            try:
-                await asyncio.to_thread(self.recorder.shutdown)
-            except Exception as e:
-                print(f"{bcolors.WARNING}[DEBUG] Error during recorder shutdown: {e}{bcolors.ENDC}")
-        
-        if self.recorder_thread:
-            self.recorder_thread.join(timeout=5)
-            if self.recorder_thread.is_alive():
-                print(f"{bcolors.WARNING}[DEBUG] Recorder thread did not terminate gracefully{bcolors.ENDC}")
-
-# Global variables
 global_args = None
-recorder_manager: Optional[HybridRecorderManager] = None
+recorder = None
+recorder_config = {}
+recorder_ready = threading.Event()
+recorder_thread = None
+stop_recorder = False
 prev_text = ""
 
 # Define allowed methods and parameters for security
@@ -679,22 +197,10 @@ allowed_parameters = [
 ]
 
 # Queues and connections for control and data
-control_connections: Set[websockets.WebSocketServerProtocol] = set()
-data_connections: Set[websockets.WebSocketServerProtocol] = set()
-control_queue = asyncio.Queue()
-audio_queue = asyncio.Queue()
-
-# Connection management with weak references to prevent memory leaks
-connection_refs: Set[weakref.ref] = set()
-
-def cleanup_dead_connections():
-    """Clean up dead connections to prevent memory leaks"""
-    global connection_refs
-    dead_refs = set()
-    for ref in connection_refs:
-        if ref() is None:
-            dead_refs.add(ref)
-    connection_refs -= dead_refs
+control_connections = set()
+data_connections = set()
+control_queue = None
+audio_queue = None
 
 def preprocess_text(text):
     # Remove leading whitespaces
@@ -719,93 +225,87 @@ def preprocess_text(text):
     
     return text
 
-# Consolidated logging and formatting utilities
-class LogUtil:
-    @staticmethod
-    def debug(message, color=bcolors.OKCYAN):
-        if debug_logging:
-            timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-            thread_name = threading.current_thread().name
-            print(f"{color}[DEBUG][{timestamp}][{thread_name}] {message}{bcolors.ENDC}", file=sys.stderr)
-    
-    @staticmethod
-    def error(message, e=None):
-        error_msg = f"{message}: {e}" if e else message
-        print(f"{bcolors.FAIL}[ERROR] {error_msg}{bcolors.ENDC}")
-    
-    @staticmethod
-    def warning(message):
-        print(f"{bcolors.WARNING}[WARNING] {message}{bcolors.ENDC}")
-    
-    @staticmethod
-    def success(message):
-        print(f"{bcolors.OKGREEN}[SUCCESS] {message}{bcolors.ENDC}")
-    
-    @staticmethod
-    def format_timestamp(timestamp_ns: int) -> str:
-        dt = datetime.fromtimestamp(timestamp_ns // 1_000_000_000)
-        ms = (timestamp_ns % 1_000_000_000) // 1_000_000
-        return f"{dt.strftime('%H:%M:%S')}.{ms:03d}"
+def debug_print(message):
+    if debug_logging:
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        thread_name = threading.current_thread().name
+        print(f"{Fore.CYAN}[DEBUG][{timestamp}][{thread_name}] {message}{Style.RESET_ALL}", file=sys.stderr)
 
-# Consolidated callback functions to reduce duplication
-async def _send_message_async(message_type: str, **kwargs):
-    """Generic async function to send messages to clients"""
-    message = json.dumps({'type': message_type, **kwargs})
-    await audio_queue.put(message)
+def format_timestamp_ns(timestamp_ns: int) -> str:
+    # Split into whole seconds and the nanosecond remainder
+    seconds = timestamp_ns // 1_000_000_000
+    remainder_ns = timestamp_ns % 1_000_000_000
 
-async def text_detected_async(text, loop):
-    """Async version of text_detected for thread-safe processing"""
-    global prev_text
+    # Convert seconds part into a datetime object (local time)
+    dt = datetime.fromtimestamp(seconds)
 
-    print(f"{bcolors.OKCYAN}[DEBUG] text_detected called with: '{text}'{bcolors.ENDC}")
+    # Format the main time as HH:MM:SS
+    time_str = dt.strftime("%H:%M:%S")
+
+    # For instance, if you want milliseconds, divide the remainder by 1e6 and format as 3-digit
+    milliseconds = remainder_ns // 1_000_000
+    formatted_timestamp = f"{time_str}.{milliseconds:03d}"
+
+    return formatted_timestamp
+
+def text_detected(text, loop):
+    global prev_text, audio_queue
 
     text = preprocess_text(text)
-    
-    # Check for duplicate text to prevent stuck loops
-    if recorder_manager:
-        if text == recorder_manager.last_processed_text:
-            recorder_manager.text_repeat_count += 1
-            print(f"{bcolors.WARNING}[DEBUG] Duplicate text detected (count: {recorder_manager.text_repeat_count}): '{text}'{bcolors.ENDC}")
-            
-            # If we're getting too many repeats, trigger recovery
-            if recorder_manager.text_repeat_count >= recorder_manager.max_text_repeats:
-                print(f"{bcolors.FAIL}[DEBUG] Too many text repeats, triggering recovery{bcolors.ENDC}")
-                recorder_manager.processing_state = "stuck"
-                # Don't send the duplicate message
-                return
-        else:
-            # Reset repeat count for new text
-            recorder_manager.text_repeat_count = 0
-            recorder_manager.last_processed_text = text
-            recorder_manager.processing_state = "processing"
-    
-    # Update metrics
-    server_metrics.reset_activity()
 
     if silence_timing:
         def ends_with_ellipsis(text: str):
-            return text.endswith("...") or (len(text) > 1 and text[:-1].endswith("..."))
+            if text.endswith("..."):
+                return True
+            if len(text) > 1 and text[:-1].endswith("..."):
+                return True
+            return False
 
         def sentence_end(text: str):
             sentence_end_marks = ['.', '!', '?', '。']
-            return text and text[-1] in sentence_end_marks
+            if text and text[-1] in sentence_end_marks:
+                return True
+            return False
 
-        if recorder_manager and recorder_manager.recorder:
-            try:
-                if ends_with_ellipsis(text):
-                    recorder_manager.recorder.post_speech_silence_duration = global_args.mid_sentence_detection_pause
-                elif sentence_end(text) and sentence_end(prev_text) and not ends_with_ellipsis(prev_text):
-                    recorder_manager.recorder.post_speech_silence_duration = global_args.end_of_sentence_detection_pause
-                else:
-                    recorder_manager.recorder.post_speech_silence_duration = global_args.unknown_sentence_detection_pause
-            except Exception as e:
-                print(f"{bcolors.WARNING}[DEBUG] Error updating silence duration: {e}{bcolors.ENDC}")
+
+        if ends_with_ellipsis(text):
+            recorder.post_speech_silence_duration = global_args.mid_sentence_detection_pause
+        elif sentence_end(text) and sentence_end(prev_text) and not ends_with_ellipsis(prev_text):
+            recorder.post_speech_silence_duration = global_args.end_of_sentence_detection_pause
+        else:
+            recorder.post_speech_silence_duration = global_args.unknown_sentence_detection_pause
+
+
+        # Append the new text with its timestamp
+        current_time = time.time()
+        text_time_deque.append((current_time, text))
+
+        # Remove texts older than hard_break_even_on_background_noise seconds
+        while text_time_deque and text_time_deque[0][0] < current_time - hard_break_even_on_background_noise:
+            text_time_deque.popleft()
+
+        # Check if at least hard_break_even_on_background_noise_min_texts texts have arrived within the last hard_break_even_on_background_noise seconds
+        if len(text_time_deque) >= hard_break_even_on_background_noise_min_texts:
+            texts = [t[1] for t in text_time_deque]
+            first_text = texts[0]
+            last_text = texts[-1]
+
+            # Compute the similarity ratio between the first and last texts
+            similarity = SequenceMatcher(None, first_text, last_text).ratio()
+
+            if similarity > hard_break_even_on_background_noise_min_similarity and len(first_text) > hard_break_even_on_background_noise_min_chars:
+                recorder.stop()
+                recorder.clear_audio_queue()
+                prev_text = ""
 
     prev_text = text
 
-    # Send realtime message
-    await _send_message_async('realtime', text=text)
-    print(f"{bcolors.OKGREEN}[DEBUG] Queuing realtime message: {json.dumps({'type': 'realtime', 'text': text})}{bcolors.ENDC}")
+    # Put the message in the audio queue to be sent to clients
+    message = json.dumps({
+        'type': 'realtime',
+        'text': text
+    })
+    asyncio.run_coroutine_threadsafe(audio_queue.put(message), loop)
 
     # Get current timestamp in HH:MM:SS.nnn format
     timestamp = datetime.now().strftime('%H:%M:%S.%f')[:-3]
@@ -815,94 +315,98 @@ async def text_detected_async(text, loop):
     else:
         print(f"\r[{timestamp}] {bcolors.OKCYAN}{text}{bcolors.ENDC}", flush=True, end='')
 
-def text_detected(text, loop):
-    """Thread-safe wrapper for text_detected"""
-    if recorder_manager:
-        # Queue the async callback for processing
-        recorder_manager.callback_queue.put((text_detected_async, (text, loop), {}))
-    else:
-        # Fallback to direct call if recorder_manager is not available
-        asyncio.run_coroutine_threadsafe(text_detected_async(text, loop), loop)
+def on_recording_start(loop):
+    global audio_queue
+    message = json.dumps({
+        'type': 'recording_start'
+    })
+    asyncio.run_coroutine_threadsafe(audio_queue.put(message), loop)
 
-def reset_recorder_state():
-    """Reset recorder state to default values"""
-    global prev_text
-    prev_text = ""
-    if recorder_manager and recorder_manager.recorder:
-        try:
-            recorder_manager.recorder.post_speech_silence_duration = global_args.unknown_sentence_detection_pause
-            # Also call the internal reset method
-            recorder_manager._reset_recorder_state()
-            print(f"{bcolors.OKGREEN}[DEBUG] Recorder state reset{bcolors.ENDC}")
-        except Exception as e:
-            print(f"{bcolors.WARNING}[DEBUG] Error resetting recorder state: {e}{bcolors.ENDC}")
+def on_recording_stop(loop):
+    global audio_queue
+    message = json.dumps({
+        'type': 'recording_stop'
+    })
+    asyncio.run_coroutine_threadsafe(audio_queue.put(message), loop)
 
-# Consolidated async callback functions
-# Consolidated async event handlers
-async def _handle_event_async(event_type, data=None, loop=None):
-    """Generic event handler for all async events"""
-    if event_type == 'transcription_start' and data:
-        bytes_b64 = base64.b64encode(data.tobytes()).decode('utf-8')
-        await _send_message_async(event_type, audio_bytes_base64=bytes_b64)
-    elif event_type == 'recorded_chunk' and data and send_recorded_chunk:
-        bytes_b64 = base64.b64encode(data.tobytes()).decode('utf-8')
-        await _send_message_async(event_type, bytes=bytes_b64)
-    elif event_type == 'realtime_update' and data:
-        await _send_message_async(event_type, text=preprocess_text(data))
-    elif event_type in ['turn_detection_start', 'turn_detection_stop']:
-        print(f"&&& stt_server {event_type}")
-        await _send_message_async(event_type.replace('_', ' '))
-    else:
-        await _send_message_async(event_type)
+def on_vad_detect_start(loop):
+    global audio_queue
+    message = json.dumps({
+        'type': 'vad_detect_start'
+    })
+    asyncio.run_coroutine_threadsafe(audio_queue.put(message), loop)
 
-# Thread-safe wrapper functions using a factory pattern
-def _create_thread_safe_wrapper(async_func):
-    """Factory function to create thread-safe wrapper functions"""
-    def wrapper(*args, **kwargs):
-        if recorder_manager:
-            recorder_manager.callback_queue.put((async_func, args, kwargs))
-        else:
-            asyncio.run_coroutine_threadsafe(async_func(*args, **kwargs), loop)
-    return wrapper
+def on_vad_detect_stop(loop):
+    global audio_queue
+    message = json.dumps({
+        'type': 'vad_detect_stop'
+    })
+    asyncio.run_coroutine_threadsafe(audio_queue.put(message), loop)
 
-# Create event handlers dynamically
-EVENT_TYPES = [
-    'recording_start', 'recording_stop',
-    'vad_detect_start', 'vad_detect_stop',
-    'wakeword_detected', 'wakeword_detection_start', 'wakeword_detection_end',
-    'transcription_start', 'turn_detection_start', 'turn_detection_stop',
-    'realtime_transcription_update', 'recorded_chunk'
-]
+def on_wakeword_detected(loop):
+    global audio_queue
+    message = json.dumps({
+        'type': 'wakeword_detected'
+    })
+    asyncio.run_coroutine_threadsafe(audio_queue.put(message), loop)
 
-def create_event_handler(event_type):
-    async def handler(*args, **kwargs):
-        await _handle_event_async(event_type, *args, asyncio.get_event_loop())
-    return _create_thread_safe_wrapper(handler)
+def on_wakeword_detection_start(loop):
+    global audio_queue
+    message = json.dumps({
+        'type': 'wakeword_detection_start'
+    })
+    asyncio.run_coroutine_threadsafe(audio_queue.put(message), loop)
 
-# Create all event handlers dynamically
-for event_type in EVENT_TYPES:
-    globals()[f'on_{event_type}'] = create_event_handler(event_type)
+def on_wakeword_detection_end(loop):
+    global audio_queue
+    message = json.dumps({
+        'type': 'wakeword_detection_end'
+    })
+    asyncio.run_coroutine_threadsafe(audio_queue.put(message), loop)
 
-def decode_and_resample(
-        audio_data,
-        original_sample_rate,
-        target_sample_rate):
+def on_transcription_start(_audio_bytes, loop):
+    global audio_queue
+    bytes_b64 = base64.b64encode(_audio_bytes.tobytes()).decode('utf-8')
+    message = json.dumps({
+        'type': 'transcription_start',
+        'audio_bytes_base64': bytes_b64
+    })
+    asyncio.run_coroutine_threadsafe(audio_queue.put(message), loop)
 
-    # Decode 16-bit PCM data to numpy array
-    if original_sample_rate == target_sample_rate:
-        return audio_data
+def on_turn_detection_start(loop):
+    global audio_queue
+    print("&&& stt_server on_turn_detection_start")
+    message = json.dumps({
+        'type': 'start_turn_detection'
+    })
+    asyncio.run_coroutine_threadsafe(audio_queue.put(message), loop)
 
-    audio_np = np.frombuffer(audio_data, dtype=np.int16)
+def on_turn_detection_stop(loop):
+    global audio_queue
+    print("&&& stt_server on_turn_detection_stop")
+    message = json.dumps({
+        'type': 'stop_turn_detection'
+    })
+    asyncio.run_coroutine_threadsafe(audio_queue.put(message), loop)
 
-    # Calculate the number of samples after resampling
-    num_original_samples = len(audio_np)
-    num_target_samples = int(num_original_samples * target_sample_rate /
-                                original_sample_rate)
 
-    # Resample the audio
-    resampled_audio = resample(audio_np, num_target_samples)
+# def on_realtime_transcription_update(text, loop):
+#     # Send real-time transcription updates to the client
+#     text = preprocess_text(text)
+#     message = json.dumps({
+#         'type': 'realtime_update',
+#         'text': text
+#     })
+#     asyncio.run_coroutine_threadsafe(audio_queue.put(message), loop)
 
-    return resampled_audio.astype(np.int16).tobytes()
+# def on_recorded_chunk(chunk, loop):
+#     if send_recorded_chunk:
+#         bytes_b64 = base64.b64encode(chunk.tobytes()).decode('utf-8')
+#         message = json.dumps({
+#             'type': 'recorded_chunk',
+#             'bytes': bytes_b64
+#         })
+#         asyncio.run_coroutine_threadsafe(audio_queue.put(message), loop)
 
 # Define the server's arguments
 def parse_arguments():
@@ -966,7 +470,7 @@ def parse_arguments():
                         help='Minimum duration of valid recordings in seconds. This prevents very short recordings from being processed, which could be caused by noise or accidental sounds. Default is 1.1 seconds.')
 
     parser.add_argument('--min_gap_between_recordings', type=float, default=0,
-                        help='Minimum time (in seconds) between consecutive recordings. Setting this helps avoid overlapping recordings when theres a brief silence between them. Default is 0 seconds.')
+                        help='Minimum time (in seconds) between consecutive recordings. Setting this helps avoid overlapping recordings when there’s a brief silence between them. Default is 0 seconds.')
 
     parser.add_argument('--enable_realtime_transcription', action='store_true', default=True,
                         help='Enable continuous real-time transcription of audio as it is received. When enabled, transcriptions are sent in near real-time. Default is True.')
@@ -1078,26 +582,78 @@ def parse_arguments():
 
     return args
 
+def _recorder_thread(loop):
+    global recorder, stop_recorder
+    print(f"{bcolors.OKGREEN}Initializing RealtimeSTT server with parameters:{bcolors.ENDC}")
+    for key, value in recorder_config.items():
+        print(f"    {bcolors.OKBLUE}{key}{bcolors.ENDC}: {value}")
+    try:
+        recorder = AudioToTextRecorder(**recorder_config)
+        print(f"{bcolors.OKGREEN}{bcolors.BOLD}RealtimeSTT initialized{bcolors.ENDC}")
+        recorder_ready.set()
+    except Exception as e:
+        print(f"{bcolors.FAIL}Error initializing RealtimeSTT: {e}{bcolors.ENDC}")
+        debug_print(f"Recorder initialization error details: {e}")
+        recorder_ready.set()  # Set ready even on error to prevent hanging
+        return
+    
+    def process_text(full_sentence):
+        global prev_text, audio_queue
+        prev_text = ""
+        full_sentence = preprocess_text(full_sentence)
+        message = json.dumps({
+            'type': 'fullSentence',
+            'text': full_sentence
+        })
+        # Use the passed event loop here
+        asyncio.run_coroutine_threadsafe(audio_queue.put(message), loop)
+
+        timestamp = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+
+        if extended_logging:
+            print(f"  [{timestamp}] Full text: {bcolors.BOLD}Sentence:{bcolors.ENDC} {bcolors.OKGREEN}{full_sentence}{bcolors.ENDC}\n", flush=True, end="")
+        else:
+            print(f"\r[{timestamp}] {bcolors.BOLD}Sentence:{bcolors.ENDC} {bcolors.OKGREEN}{full_sentence}{bcolors.ENDC}\n")
+    try:
+        while not stop_recorder:
+            recorder.text(process_text)
+    except KeyboardInterrupt:
+        print(f"{bcolors.WARNING}Exiting application due to keyboard interrupt{bcolors.ENDC}")
+    except Exception as e:
+        print(f"{bcolors.FAIL}Error in recorder thread: {e}{bcolors.ENDC}")
+        debug_print(f"Recorder thread error details: {e}")
+
+def decode_and_resample(
+        audio_data,
+        original_sample_rate,
+        target_sample_rate):
+
+    # Decode 16-bit PCM data to numpy array
+    if original_sample_rate == target_sample_rate:
+        return audio_data
+
+    audio_np = np.frombuffer(audio_data, dtype=np.int16)
+
+    # Calculate the number of samples after resampling
+    num_original_samples = len(audio_np)
+    num_target_samples = int(num_original_samples * target_sample_rate /
+                                original_sample_rate)
+
+    # Resample the audio
+    resampled_audio = resample(audio_np, num_target_samples)
+
+    return resampled_audio.astype(np.int16).tobytes()
+
 async def control_handler(websocket):
-    LogUtil.debug(f"New control connection from {websocket.remote_address}")
+    debug_print(f"New control connection from {websocket.remote_address}")
     print(f"{bcolors.OKGREEN}Control client connected{bcolors.ENDC}")
-    global recorder_manager, server_metrics
-    
-    # Track connection metrics
-    server_metrics.active_connections += 1
-    server_metrics.total_connections += 1
-    
+    global recorder
     control_connections.add(websocket)
-    connection_refs.add(weakref.ref(websocket))
-    
-    # Reset recorder state for new control connection
-    reset_recorder_state()
-    
     try:
         async for message in websocket:
-            LogUtil.debug(f"Received control message: {message[:200]}...")
-            if not recorder_manager.ready_event.is_set():
-                LogUtil.warning("Recorder not ready")
+            debug_print(f"Received control message: {message[:200]}...")
+            if not recorder_ready.is_set():
+                print(f"{bcolors.WARNING}Recorder not ready{bcolors.ENDC}")
                 continue
             if isinstance(message, str):
                 # Handle text message (command)
@@ -1107,13 +663,8 @@ async def control_handler(websocket):
                     if command == "set_parameter":
                         parameter = command_data.get("parameter")
                         value = command_data.get("value")
-                        if parameter in allowed_parameters and hasattr(recorder_manager.recorder, parameter):
-                            try:
-                                setattr(recorder_manager.recorder, parameter, value)
-                            except Exception as e:
-                                print(f"{bcolors.WARNING}[DEBUG] Error setting parameter {parameter}: {e}{bcolors.ENDC}")
-                                await websocket.send(json.dumps({"status": "error", "message": f"Error setting parameter {parameter}: {e}"}))
-                                continue
+                        if parameter in allowed_parameters and hasattr(recorder, parameter):
+                            setattr(recorder, parameter, value)
                             # Format the value for output
                             if isinstance(value, float):
                                 value_formatted = f"{value:.2f}"
@@ -1135,13 +686,8 @@ async def control_handler(websocket):
                     elif command == "get_parameter":
                         parameter = command_data.get("parameter")
                         request_id = command_data.get("request_id")  # Get the request_id from the command data
-                        if parameter in allowed_parameters and hasattr(recorder_manager.recorder, parameter):
-                            try:
-                                value = getattr(recorder_manager.recorder, parameter)
-                            except Exception as e:
-                                print(f"{bcolors.WARNING}[DEBUG] Error getting parameter {parameter}: {e}{bcolors.ENDC}")
-                                await websocket.send(json.dumps({"status": "error", "message": f"Error getting parameter {parameter}: {e}"}))
-                                continue
+                        if parameter in allowed_parameters and hasattr(recorder, parameter):
+                            value = getattr(recorder, parameter)
                             if isinstance(value, float):
                                 value_formatted = f"{value:.2f}"
                             else:
@@ -1166,16 +712,11 @@ async def control_handler(websocket):
                     elif command == "call_method":
                         method_name = command_data.get("method")
                         if method_name in allowed_methods:
-                            method = getattr(recorder_manager.recorder, method_name, None)
+                            method = getattr(recorder, method_name, None)
                             if method and callable(method):
                                 args = command_data.get("args", [])
                                 kwargs = command_data.get("kwargs", {})
-                                try:
-                                    method(*args, **kwargs)
-                                except Exception as e:
-                                    print(f"{bcolors.WARNING}[DEBUG] Error calling method {method_name}: {e}{bcolors.ENDC}")
-                                    await websocket.send(json.dumps({"status": "error", "message": f"Error calling method {method_name}: {e}"}))
-                                    continue
+                                method(*args, **kwargs)
                                 timestamp = datetime.now().strftime('%H:%M:%S.%f')[:-3]
                                 print(f"  [{timestamp}] {bcolors.OKGREEN}Called method recorder.{bcolors.OKBLUE}{method_name}{bcolors.ENDC}")
                                 await websocket.send(json.dumps({"status": "success", "message": f"Method {method_name} called"}))
@@ -1193,154 +734,91 @@ async def control_handler(websocket):
                     await websocket.send(json.dumps({"status": "error", "message": "Invalid JSON command"}))
             else:
                 print(f"{bcolors.WARNING}Received unknown message type on control connection{bcolors.ENDC}")
+    except (websockets.exceptions.InvalidHandshake, websockets.exceptions.InvalidMessage):
+        # This is likely a health check connection - log and ignore
+        debug_print(f"Invalid handshake/message from {websocket.remote_address} - likely health check")
+        return
     except websockets.exceptions.ConnectionClosed as e:
         print(f"{bcolors.WARNING}Control client disconnected: {e}{bcolors.ENDC}")
+    except Exception as e:
+        # Log other errors but don't crash
+        debug_print(f"WebSocket error from {websocket.remote_address}: {e}")
     finally:
         control_connections.remove(websocket)
-        server_metrics.active_connections -= 1
-        cleanup_dead_connections()
-        # Reset recorder state when control connection closes
-        reset_recorder_state()
 
 async def data_handler(websocket):
-    global writechunks, wav_file, server_metrics, recorder_manager, prev_text
+    global writechunks, wav_file
     print(f"{bcolors.OKGREEN}Data client connected{bcolors.ENDC}")
-    
-    # Track connection metrics
-    server_metrics.active_connections += 1
-    server_metrics.total_connections += 1
-    
-    # Force cleanup of all existing connections
-    for conn in list(data_connections):
-        try:
-            await conn.close(1000, "New connection taking over")
-        except Exception as e:
-            print(f"{bcolors.WARNING}[DEBUG] Error closing existing connection: {e}{bcolors.ENDC}")
-        data_connections.discard(conn)
-    
-    # Clear all connection references
-    data_connections.clear()
-    connection_refs.clear()
-    
-    # Add new connection
     data_connections.add(websocket)
-    connection_refs.add(weakref.ref(websocket))
-    print(f"{bcolors.OKCYAN}[DEBUG] New data connection established. Total connections: {len(data_connections)}{bcolors.ENDC}")
-    
-    # Perform a complete recorder reset
     try:
-        if recorder_manager:
-            print(f"{bcolors.OKBLUE}[DEBUG] Starting complete recorder reset...{bcolors.ENDC}")
-            
-            # Stop all ongoing processing
-            recorder_manager.stop_recorder = True
-            await asyncio.sleep(0.1)  # Give time for processing to stop
-            recorder_manager.stop_recorder = False
-            
-            # Reset all state variables
-            recorder_manager.processing_state = "idle"
-            recorder_manager.text_repeat_count = 0
-            recorder_manager.last_processed_text = ""
-            prev_text = ""  # Reset global prev_text
-            
-            # Clear all queues
-            if hasattr(recorder_manager.recorder, 'clear_audio_queue'):
-                await asyncio.to_thread(recorder_manager.recorder.clear_audio_queue)
-            while not recorder_manager.audio_queue.empty():
-                try:
-                    recorder_manager.audio_queue.get_nowait()
-                except queue.Empty:
-                    break
-                    
-            while not recorder_manager.result_queue.empty():
-                try:
-                    recorder_manager.result_queue.get_nowait()
-                except queue.Empty:
-                    break
-                    
-            while not recorder_manager.callback_queue.empty():
-                try:
-                    recorder_manager.callback_queue.get_nowait()
-                except queue.Empty:
-                    break
-            
-            # Reset recorder's internal state
-            await asyncio.to_thread(recorder_manager._reset_recorder_state)
-            
-            # Reset health monitoring state
-            recorder_health.state = RecorderState.READY
-            recorder_health.consecutive_errors = 0
-            recorder_health.recovery_attempts = 0
-            
-            print(f"{bcolors.OKGREEN}[DEBUG] Complete recorder reset successful{bcolors.ENDC}")
-    except Exception as e:
-        print(f"{bcolors.FAIL}[ERROR] Failed to reset recorder state: {e}{bcolors.ENDC}")
-        recorder_health.record_error()
-    
-    try:
-        # Send initial ready state to client
-        try:
-            await websocket.send(json.dumps({"type": "status", "status": "ready"}))
-        except Exception as e:
-            print(f"{bcolors.WARNING}[DEBUG] Error sending ready status: {e}{bcolors.ENDC}")
-        
         while True:
             message = await websocket.recv()
             if isinstance(message, bytes):
-                                    # Handle binary message (audio data)
+                if extended_logging:
+                    debug_print(f"Received audio chunk (size: {len(message)} bytes)")
+                elif log_incoming_chunks:
+                    print(".", end='', flush=True)
+                # Handle binary message (audio data)
+                try:
                     metadata_length = int.from_bytes(message[:4], byteorder='little')
                     metadata_json = message[4:4+metadata_length].decode('utf-8')
                     metadata = json.loads(metadata_json)
                     sample_rate = metadata['sampleRate']
-                    chunk = message[4+metadata_length:]
+                except (ValueError, json.JSONDecodeError, KeyError, UnicodeDecodeError) as e:
+                    debug_print(f"Error parsing audio metadata: {e}")
+                    continue
 
-                    if extended_logging:
-                        LogUtil.debug(f"Received audio chunk (size: {len(message)} bytes)")
-                        LogUtil.debug(f"Processing audio chunk with sample rate {sample_rate}")
-                    elif log_incoming_chunks:
-                        print(".", end='', flush=True)
+                if 'server_sent_to_stt' in metadata:
+                    stt_received_ns = time.time_ns()
+                    metadata["stt_received"] = stt_received_ns
+                    metadata["stt_received_formatted"] = format_timestamp_ns(stt_received_ns)
+                    print(f"Server received audio chunk of length {len(message)} bytes, metadata: {metadata}")
 
-                    if 'server_sent_to_stt' in metadata:
-                        stt_received_ns = time.time_ns()
-                        metadata["stt_received"] = stt_received_ns
-                        metadata["stt_received_formatted"] = LogUtil.format_timestamp(stt_received_ns)
-                        LogUtil.debug(f"Server received audio chunk of length {len(message)} bytes, metadata: {metadata}")
+                if extended_logging:
+                    debug_print(f"Processing audio chunk with sample rate {sample_rate}")
+                chunk = message[4+metadata_length:]
 
-                    if writechunks:
+                if writechunks:
+                    try:
                         if not wav_file:
                             wav_file = wave.open(writechunks, 'wb')
                             wav_file.setnchannels(CHANNELS)
                             wav_file.setsampwidth(pyaudio.get_sample_size(FORMAT))
                             wav_file.setframerate(sample_rate)
-                        wav_file.writeframes(chunk)
 
+                        wav_file.writeframes(chunk)
+                    except Exception as e:
+                        debug_print(f"Error writing to WAV file: {e}")
+
+                try:
                     if sample_rate != 16000:
                         resampled_chunk = decode_and_resample(chunk, sample_rate, 16000)
                         if extended_logging:
-                            LogUtil.debug(f"Resampled chunk size: {len(resampled_chunk)} bytes")
-                        await recorder_manager.process_audio(resampled_chunk)
+                            debug_print(f"Resampled chunk size: {len(resampled_chunk)} bytes")
+                        recorder.feed_audio(resampled_chunk)
                     else:
-                        await recorder_manager.process_audio(chunk)
-                
-                    # Update heartbeat timer when audio is fed to recorder
-                    if 'last_activity_time' in globals():
-                        globals()['last_activity_time'] = time.time()
+                        recorder.feed_audio(chunk)
+                except Exception as e:
+                    debug_print(f"Error processing audio chunk: {e}")
             else:
                 print(f"{bcolors.WARNING}Received non-binary message on data connection{bcolors.ENDC}")
+    except (websockets.exceptions.InvalidHandshake, websockets.exceptions.InvalidMessage):
+        # This is likely a health check connection - log and ignore
+        debug_print(f"Invalid handshake/message from {websocket.remote_address} - likely health check")
+        return
     except websockets.exceptions.ConnectionClosed as e:
         print(f"{bcolors.WARNING}Data client disconnected: {e}{bcolors.ENDC}")
+    except Exception as e:
+        # Log other errors but don't crash
+        debug_print(f"WebSocket error from {websocket.remote_address}: {e}")
     finally:
-        data_connections.discard(websocket)
-        server_metrics.active_connections -= 1
-        cleanup_dead_connections()
-        print(f"{bcolors.OKCYAN}[DEBUG] Total data connections after disconnect: {len(data_connections)}{bcolors.ENDC}")
-        # Reset recorder state when connection closes
-        reset_recorder_state()
+        data_connections.remove(websocket)
+        recorder.clear_audio_queue()  # Ensure audio queue is cleared if client disconnects
 
 async def broadcast_audio_messages():
+    global audio_queue
     while True:
         message = await audio_queue.get()
-        print(f"{bcolors.OKCYAN}[DEBUG] Broadcasting message to {len(data_connections)} connections{bcolors.ENDC}")
         for conn in list(data_connections):
             try:
                 timestamp = datetime.now().strftime('%H:%M:%S.%f')[:-3]
@@ -1348,123 +826,12 @@ async def broadcast_audio_messages():
                 if extended_logging:
                     print(f"  [{timestamp}] Sending message: {bcolors.OKBLUE}{message}{bcolors.ENDC}\n", flush=True, end="")
                 await conn.send(message)
-                print(f"{bcolors.OKGREEN}[DEBUG] Successfully sent message to connection{bcolors.ENDC}")
-            except websockets.exceptions.ConnectionClosed as e:
-                print(f"{bcolors.WARNING}[DEBUG] Connection closed while sending: {e}{bcolors.ENDC}")
-                data_connections.discard(conn)
+            except websockets.exceptions.ConnectionClosed:
+                data_connections.remove(conn)
             except Exception as e:
-                print(f"{bcolors.FAIL}[DEBUG] Error sending message: {e}{bcolors.ENDC}")
-                # Don't remove connection for general exceptions, only for ConnectionClosed
-
-# Production-ready HTTP health check server with metrics
-async def health_check_handler(request):
-    """Production health check endpoint with detailed status"""
-    global recorder_health, server_metrics
-    
-    # Check if recorder is healthy
-    is_healthy = (
-        recorder_health.state in [RecorderState.READY, RecorderState.PROCESSING] and
-        server_metrics.get_uptime() > 0
-    )
-    
-    status_code = 200 if is_healthy else 503
-    
-    health_data = {
-        "status": "healthy" if is_healthy else "unhealthy",
-        "recorder_state": recorder_health.state.value,
-        "uptime_seconds": round(server_metrics.get_uptime(), 2),
-        "active_connections": server_metrics.active_connections,
-        "total_connections": server_metrics.total_connections,
-        "connections_per_minute": round(server_metrics.get_connections_per_minute(), 2),
-        "audio_chunks_processed": server_metrics.audio_chunks_processed,
-        "transcription_errors": server_metrics.transcription_errors,
-        "recorder_errors": server_metrics.recorder_errors,
-        "last_activity_seconds": round(time.time() - server_metrics.last_activity, 2),
-        "consecutive_errors": recorder_health.consecutive_errors,
-        "recovery_attempts": recorder_health.recovery_attempts
-    }
-    
-    return web.json_response(health_data, status=status_code)
-
-async def metrics_handler(request):
-    """Detailed metrics endpoint for monitoring"""
-    global recorder_health, server_metrics
-    
-    metrics_data = {
-        "server": {
-            "uptime_seconds": round(server_metrics.get_uptime(), 2),
-            "start_time": server_metrics.start_time,
-            "last_activity": server_metrics.last_activity
-        },
-        "connections": {
-            "active": server_metrics.active_connections,
-            "total": server_metrics.total_connections,
-            "rate_per_minute": round(server_metrics.get_connections_per_minute(), 2)
-        },
-        "processing": {
-            "audio_chunks_processed": server_metrics.audio_chunks_processed,
-            "transcription_errors": server_metrics.transcription_errors,
-            "recorder_errors": server_metrics.recorder_errors
-        },
-        "recorder": {
-            "state": recorder_health.state.value,
-            "last_successful_processing": recorder_health.last_successful_processing,
-            "consecutive_errors": recorder_health.consecutive_errors,
-            "recovery_attempts": recorder_health.recovery_attempts,
-            "can_recover": recorder_health.can_recover()
-        }
-    }
-    
-    return web.json_response(metrics_data)
-
-async def start_health_check_server(port=8080):
-    """Start a production-ready HTTP health check server on the specified port"""
-    app = web.Application()
-    app.router.add_get("/health", health_check_handler)
-    app.router.add_get("/metrics", metrics_handler)
-    app.router.add_get("/", health_check_handler)  # Also respond to root path
-    
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    
-    print(f"{bcolors.OKGREEN}Production health check server started on {bcolors.OKBLUE}http://0.0.0.0:{port}/health{bcolors.ENDC}")
-    print(f"{bcolors.OKGREEN}Metrics endpoint available at {bcolors.OKBLUE}http://0.0.0.0:{port}/metrics{bcolors.ENDC}")
-    return runner
-
-async def production_monitoring():
-    """Production monitoring task that runs without blocking"""
-    while True:
-        try:
-            await asyncio.sleep(30)  # Check every 30 seconds
-            
-            # Log production metrics
-            uptime = server_metrics.get_uptime()
-            connections_per_min = server_metrics.get_connections_per_minute()
-            
-            print(f"{bcolors.OKCYAN}[PRODUCTION] Uptime: {uptime:.1f}s, "
-                  f"Active: {server_metrics.active_connections}, "
-                  f"Total: {server_metrics.total_connections}, "
-                  f"Rate: {connections_per_min:.1f}/min, "
-                  f"Audio chunks: {server_metrics.audio_chunks_processed}, "
-                  f"Errors: {server_metrics.transcription_errors + server_metrics.recorder_errors}, "
-                  f"Recorder state: {recorder_health.state.value}{bcolors.ENDC}")
-            
-            # Check for potential issues
-            if server_metrics.transcription_errors + server_metrics.recorder_errors > 100:
-                print(f"{bcolors.WARNING}[PRODUCTION] High error rate detected!{bcolors.ENDC}")
-            
-            if recorder_health.state == RecorderState.ERROR:
-                print(f"{bcolors.WARNING}[PRODUCTION] Recorder in error state!{bcolors.ENDC}")
-            
-            # Clean up dead connections periodically
-            cleanup_dead_connections()
-            
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            print(f"{bcolors.WARNING}[PRODUCTION] Monitoring error: {e}{bcolors.ENDC}")
+                # Log other errors but don't crash
+                debug_print(f"Error sending message to client: {e}")
+                data_connections.remove(conn)
 
 # Helper function to create event loop bound closures for callbacks
 def make_callback(loop, callback):
@@ -1472,146 +839,194 @@ def make_callback(loop, callback):
         callback(*args, **kwargs, loop=loop)
     return inner_callback
 
-class STTServer:
-    def __init__(self, args):
-        self.args = args
-        self.loop = asyncio.get_event_loop()
-        self.tasks = []
-        self.servers = {}
-        
-    async def start(self):
-        """Start all server components"""
-        try:
-            # Initialize recorder manager
-            recorder_config = self._create_recorder_config()
-            global recorder_manager
-            recorder_manager = HybridRecorderManager(recorder_config, self.loop)
-            await recorder_manager.initialize()
-            
-            # Start servers
-            await self._start_websocket_servers()
-            await self._start_health_check_server()
-            
-            # Start background tasks
-            self.tasks.extend([
-                asyncio.create_task(broadcast_audio_messages()),
-                asyncio.create_task(production_monitoring())
-            ])
-            
-            LogUtil.success("Production server started. Press Ctrl+C to stop.")
-            LogUtil.success(f"Monitoring: http://0.0.0.0:8080/health")
-            LogUtil.success(f"Metrics: http://0.0.0.0:8080/metrics")
-            
-            # Wait for broadcast task
-            await self.tasks[0]
-            
-        except OSError as e:
-            LogUtil.error("Could not start server - ports may be in use")
-            raise
-        except KeyboardInterrupt:
-            LogUtil.warning("Server interrupted by user")
-        except Exception as e:
-            LogUtil.error("Server error", e)
-            raise
-        finally:
-            await self.shutdown()
-    
-    def _create_recorder_config(self):
-        """Create recorder configuration from arguments"""
-        config = {
-            k: getattr(self.args, k.replace('-', '_'))
-            for k in [
-                'model', 'download_root', 'realtime_model_type', 'language', 'batch_size',
-                'init_realtime_after_seconds', 'realtime_batch_size', 'initial_prompt_realtime',
-                'input_device_index', 'silero_sensitivity', 'silero_use_onnx', 'webrtc_sensitivity',
-                'post_speech_silence_duration', 'min_length_of_recording', 'min_gap_between_recordings',
-                'enable_realtime_transcription', 'realtime_processing_pause', 'silero_deactivity_detection',
-                'early_transcription_on_silence', 'beam_size', 'beam_size_realtime', 'initial_prompt',
-                'wake_words', 'wake_words_sensitivity', 'wake_word_timeout', 'wake_word_activation_delay',
-                'wakeword_backend', 'openwakeword_model_paths', 'openwakeword_inference_framework',
-                'wake_word_buffer_duration', 'use_main_model_for_realtime', 'use_extended_logging',
-                'compute_type', 'gpu_device_index', 'device', 'handle_buffer_overflow', 'suppress_tokens',
-                'allowed_latency_limit', 'faster_whisper_vad_filter'
-            ] if hasattr(self.args, k.replace('-', '_'))
-        }
-        return {**config, 'spinner': False, 'use_microphone': False, 'no_log_file': True, 'level': loglevel}
-    
-    async def _start_websocket_servers(self):
-        """Start WebSocket servers for control and data"""
-        try:
-            self.servers['control'] = await serve(control_handler, "0.0.0.0", self.args.control)
-            self.servers['data'] = await serve(data_handler, "0.0.0.0", self.args.data)
-            LogUtil.success(f"Control server started on ws://0.0.0.0:{self.args.control}")
-            LogUtil.success(f"Data server started on ws://0.0.0.0:{self.args.data}")
-        except Exception as e:
-            LogUtil.error("Failed to start WebSocket servers", e)
-            raise
-    
-    async def _start_health_check_server(self):
-        """Start HTTP health check server"""
-        try:
-            self.servers['health'] = await start_health_check_server(port=8080)
-        except Exception as e:
-            LogUtil.error("Failed to start health check server", e)
-            raise
-    
-    async def shutdown(self):
-        """Graceful shutdown of all components"""
-        await shutdown_procedure()
-        LogUtil.success("Server shutdown complete")
 
-async def main_async():
-    global global_args
+
+
+
+# Simple HTTP health check server
+async def health_check_handler(request):
+    """Simple HTTP health check endpoint that returns 200 OK"""
+    return web.Response(text="OK", content_type="text/plain")
+
+async def start_health_check_server(port=8080):
+    """Start a simple HTTP health check server on the specified port"""
+    app = web.Application()
+    app.router.add_get("/health", health_check_handler)
+    app.router.add_get("/", health_check_handler)  # Also respond to root path
+    
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    
+    print(f"{bcolors.OKGREEN}Health check server started on {bcolors.OKBLUE}http://0.0.0.0:{port}/health{bcolors.ENDC}")
+    return runner
+
+async def main_async():            
+    global stop_recorder, recorder_config, global_args, control_server, data_server, control_queue, audio_queue
     args = parse_arguments()
     global_args = args
-    server = STTServer(args)
-    await server.start()
+
+    # Get the event loop here and pass it to the recorder thread
+    loop = asyncio.get_event_loop()
+    
+    # Initialize asyncio queues within the event loop context
+    control_queue = asyncio.Queue()
+    audio_queue = asyncio.Queue()
+
+    recorder_config = {
+        'model': args.model,
+        'download_root': args.root,
+        'realtime_model_type': args.rt_model,
+        'language': args.lang,
+        'batch_size': args.batch,
+        'init_realtime_after_seconds': args.init_realtime_after_seconds,
+        'realtime_batch_size': args.realtime_batch_size,
+        'initial_prompt_realtime': args.initial_prompt_realtime,
+        'input_device_index': args.input_device,
+        'silero_sensitivity': args.silero_sensitivity,
+        'silero_use_onnx': args.silero_use_onnx,
+        'webrtc_sensitivity': args.webrtc_sensitivity,
+        'post_speech_silence_duration': args.unknown_sentence_detection_pause,
+        'min_length_of_recording': args.min_length_of_recording,
+        'min_gap_between_recordings': args.min_gap_between_recordings,
+        'enable_realtime_transcription': args.enable_realtime_transcription,
+        'realtime_processing_pause': args.realtime_processing_pause,
+        'silero_deactivity_detection': args.silero_deactivity_detection,
+        'early_transcription_on_silence': args.early_transcription_on_silence,
+        'beam_size': args.beam_size,
+        'beam_size_realtime': args.beam_size_realtime,
+        'initial_prompt': args.initial_prompt,
+        'wake_words': args.wake_words,
+        'wake_words_sensitivity': args.wake_words_sensitivity,
+        'wake_word_timeout': args.wake_word_timeout,
+        'wake_word_activation_delay': args.wake_word_activation_delay,
+        'wakeword_backend': args.wakeword_backend,
+        'openwakeword_model_paths': args.openwakeword_model_paths,
+        'openwakeword_inference_framework': args.openwakeword_inference_framework,
+        'wake_word_buffer_duration': args.wake_word_buffer_duration,
+        'use_main_model_for_realtime': args.use_main_model_for_realtime,
+        'spinner': False,
+        'use_microphone': False,
+
+        'on_realtime_transcription_update': make_callback(loop, text_detected),
+        'on_recording_start': make_callback(loop, on_recording_start),
+        'on_recording_stop': make_callback(loop, on_recording_stop),
+        'on_vad_detect_start': make_callback(loop, on_vad_detect_start),
+        'on_vad_detect_stop': make_callback(loop, on_vad_detect_stop),
+        'on_wakeword_detected': make_callback(loop, on_wakeword_detected),
+        'on_wakeword_detection_start': make_callback(loop, on_wakeword_detection_start),
+        'on_wakeword_detection_end': make_callback(loop, on_wakeword_detection_end),
+        'on_transcription_start': make_callback(loop, on_transcription_start),
+        'on_turn_detection_start': make_callback(loop, on_turn_detection_start),
+        'on_turn_detection_stop': make_callback(loop, on_turn_detection_stop),
+
+        # 'on_recorded_chunk': make_callback(loop, on_recorded_chunk),
+        'no_log_file': True,  # Disable logging to file
+        'use_extended_logging': args.use_extended_logging,
+        'level': loglevel,
+        'compute_type': args.compute_type,
+        'gpu_device_index': args.gpu_device_index,
+        'device': args.device,
+        'handle_buffer_overflow': args.handle_buffer_overflow,
+        'suppress_tokens': args.suppress_tokens,
+        'allowed_latency_limit': args.allowed_latency_limit,
+        'faster_whisper_vad_filter': args.faster_whisper_vad_filter,
+    }
+
+    try:
+        # Attempt to start control and data servers with proper error handling
+        try:
+            control_server = await serve(
+                control_handler, 
+                "0.0.0.0", 
+                args.control
+            )
+            data_server = await serve(
+                data_handler, 
+                "0.0.0.0", 
+                args.data
+            )
+            print(f"{bcolors.OKGREEN}Control server started on {bcolors.OKBLUE}ws://0.0.0.0:{args.control}{bcolors.ENDC}")
+            print(f"{bcolors.OKGREEN}Data server started on {bcolors.OKBLUE}ws://0.0.0.0:{args.data}{bcolors.ENDC}")
+        except Exception as e:
+            print(f"{bcolors.FAIL}Error starting WebSocket servers: {e}{bcolors.ENDC}")
+            raise
+
+        # Start HTTP health check server
+        try:
+            health_check_runner = await start_health_check_server(port=8080)
+        except Exception as e:
+            print(f"{bcolors.FAIL}Error starting health check server: {e}{bcolors.ENDC}")
+            raise
+
+        # Start the broadcast and recorder threads
+        broadcast_task = asyncio.create_task(broadcast_audio_messages())
+
+        recorder_thread = threading.Thread(target=_recorder_thread, args=(loop,))
+        recorder_thread.start()
+        recorder_ready.wait()
+
+        print(f"{bcolors.OKGREEN}Server started. Press Ctrl+C to stop the server.{bcolors.ENDC}")
+
+        # Run server tasks - wait for broadcast task to complete or server shutdown
+        try:
+            await broadcast_task
+        except asyncio.CancelledError:
+            pass
+    except OSError as e:
+        print(f"{bcolors.FAIL}Error: Could not start server on specified ports. It’s possible another instance of the server is already running, or the ports are being used by another application.{bcolors.ENDC}")
+    except KeyboardInterrupt:
+        print(f"{bcolors.WARNING}Server interrupted by user, shutting down...{bcolors.ENDC}")
+    finally:
+        # Shutdown procedures for recorder and server threads
+        await shutdown_procedure()
+        print(f"{bcolors.OKGREEN}Server shutdown complete.{bcolors.ENDC}")
 
 async def shutdown_procedure():
-    """Graceful shutdown of all server components"""
-    global recorder_manager
+    global stop_recorder, recorder_thread, control_server, data_server, wav_file
     
-    LogUtil.success("Starting graceful shutdown...")
+    # Close WebSocket servers first
+    if 'control_server' in globals() and control_server:
+        control_server.close()
+        await control_server.wait_closed()
+        print(f"{bcolors.OKGREEN}Control server closed{bcolors.ENDC}")
     
-    # Close all servers
-    for server_type, server in STTServer.servers.items():
-        try:
-            if server_type == 'health':
-                await server.cleanup()
-            else:
-                server.close()
-                await server.wait_closed()
-            LogUtil.success(f"{server_type.title()} server closed")
-        except Exception as e:
-            LogUtil.error(f"Error closing {server_type} server", e)
+    if 'data_server' in globals() and data_server:
+        data_server.close()
+        await data_server.wait_closed()
+        print(f"{bcolors.OKGREEN}Data server closed{bcolors.ENDC}")
     
-    # Shutdown recorder manager
-    if recorder_manager:
-        await recorder_manager.shutdown()
-        LogUtil.success("Recorder manager shut down")
+    # Close health check server if it exists
+    if 'health_check_runner' in globals() and health_check_runner:
+        await health_check_runner.cleanup()
+        print(f"{bcolors.OKGREEN}Health check server closed{bcolors.ENDC}")
+    
+    if recorder:
+        stop_recorder = True
+        recorder.abort()
+        recorder.stop()
+        recorder.shutdown()
+        print(f"{bcolors.OKGREEN}Recorder shut down{bcolors.ENDC}")
 
-    # Close WAV file if open
+        if recorder_thread:
+            recorder_thread.join()
+            print(f"{bcolors.OKGREEN}Recorder thread finished{bcolors.ENDC}")
+
+    # Close WAV file if it's open
     if wav_file:
         try:
             wav_file.close()
-            LogUtil.success("WAV file closed")
+            print(f"{bcolors.OKGREEN}WAV file closed{bcolors.ENDC}")
         except Exception as e:
-            LogUtil.error("Error closing WAV file", e)
+            debug_print(f"Error closing WAV file: {e}")
 
-    # Print final metrics
-    LogUtil.success(
-        f"[FINAL METRICS] "
-        f"Uptime: {server_metrics.get_uptime():.1f}s, "
-        f"Total connections: {server_metrics.total_connections}, "
-        f"Audio chunks: {server_metrics.audio_chunks_processed}, "
-        f"Errors: {server_metrics.transcription_errors + server_metrics.recorder_errors}"
-    )
-
-    # Cancel remaining tasks
     tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
     for task in tasks:
         task.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
+
+    print(f"{bcolors.OKGREEN}All tasks cancelled, closing event loop now.{bcolors.ENDC}")
 
 def main():
     try:
@@ -1620,6 +1035,10 @@ def main():
         # Capture any final KeyboardInterrupt to prevent it from showing up in logs
         print(f"{bcolors.WARNING}Server interrupted by user.{bcolors.ENDC}")
         exit(0)
+    except Exception as e:
+        print(f"{bcolors.FAIL}Unexpected error in main: {e}{bcolors.ENDC}")
+        debug_print(f"Main function error details: {e}")
+        exit(1)
 
 if __name__ == '__main__':
     main()
